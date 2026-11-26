@@ -154,6 +154,12 @@ pub(super) fn note_graphics_pso(pso: usize, ps: Option<&[u8]>) {
     }
 }
 
+/// Whether a compute shader blob belongs to a pass handled by stand-in ambient lighting
+/// (`CS_ScreenProbes_TemporalResolve` / `CS_UpdateHistory`).
+pub(super) fn is_ambient_compute(blob: &[u8]) -> bool {
+    classify_cs(blob).is_some()
+}
+
 pub(super) fn note_compute_pso(pso: usize, cs: &[u8]) {
     if pso == 0 || !enabled() {
         return;
@@ -316,7 +322,7 @@ fn is_sky_dome_target(rd: &D3D12_RESOURCE_DESC) -> bool {
     rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
         && rd.Width == 128
         && rd.Height == 128
-        && rd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+        && matches!(rd.Format, DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS)
         && rd.SampleDesc.Count == 1
 }
 
@@ -489,13 +495,13 @@ cbuffer C : register(b0) {
     uint depth_h;
     uint has_depth;
     float ao_strength;
-    float _p6;
-    float _p7;
+    uint sky_ready;
+    float fallback_level;
 };
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
-    float3 amb = sky_level[0].rgb;
+    float3 amb = (sky_ready != 0) ? sky_level[0].rgb : float3(fallback_level, fallback_level, fallback_level);
     float ao = 1.0;
     if (has_depth != 0 && depth_w > 0 && depth_h > 0) {
         int2 dc = int2(
@@ -862,9 +868,25 @@ fn decode_cbv_vsharp(w: [u32; 4]) -> Option<(usize, usize)> {
     (bytes >= 4).then_some((va, bytes.min(2048)))
 }
 
+/// Resolve a GPU VA to a CPU-readable host address when it lives in a `PAGE_NOACCESS` GPU mirror view.
+fn resolve_cbv_va(va: usize) -> usize {
+    if va == 0 {
+        return 0;
+    }
+    if crate::gpu::shader::readable(va, 4) {
+        return va;
+    }
+    match crate::hle::kernelx::mirrors::mapped_source(va) {
+        Some(Some(backing)) => backing,
+        Some(None) => 0,
+        None => crate::hle::kernelx::mirrors::source(va).unwrap_or(va),
+    }
+}
+
 /// Scan up to `max_bytes` (capped at 2048 B) of readable constant-buffer memory at `va` in
 /// 256-byte chunks and feed candidate bindless descriptor indices `< MAX_SLOT_INDEX` into `push_idx`.
 unsafe fn scan_cbv_indices(va: usize, max_bytes: usize, push_idx: &mut impl FnMut(u32)) {
+    let va = resolve_cbv_va(va);
     if va == 0 || max_bytes < 4 {
         return;
     }
@@ -959,11 +981,9 @@ unsafe fn find_dispatch_views(
             ];
             if (w[3] >> 28) >= 8 {
                 direct_addrs.push(addr);
-            } else if k < 32 {
-                if let Some((cbv_va, cbv_len)) = decode_cbv_vsharp(w) {
-                    table_cbvs += 1;
-                    scan_cbv_indices(cbv_va, cbv_len, &mut push_idx);
-                }
+            } else if let Some((cbv_va, cbv_len)) = decode_cbv_vsharp(w) {
+                table_cbvs += 1;
+                scan_cbv_indices(cbv_va, cbv_len, &mut push_idx);
             }
         }
     }
@@ -1043,9 +1063,19 @@ pub(super) unsafe fn after_compute_dispatch(
     }
     let ty = list_x::tracked_list_type(list);
     if !matches!(ty, Some(D3D12_COMMAND_LIST_TYPE_DIRECT | D3D12_COMMAND_LIST_TYPE_COMPUTE)) {
+        static BAD_TY: AtomicU64 = AtomicU64::new(0);
+        if BAD_TY.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::xlog_info!("D3D12.X: ambient: {role:?} skipped on unsupported list type {ty:?}");
+        }
         return;
     }
-    let Some(layout) = layout else { return };
+    let Some(layout) = layout else {
+        static NO_LAYOUT: AtomicU64 = AtomicU64::new(0);
+        if NO_LAYOUT.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::xlog_info!("D3D12.X: ambient: {role:?} skipped (no compute root-signature layout)");
+        }
+        return;
+    };
     let Some(cl) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) else { return };
     let mut dev: Option<ID3D12Device> = None;
     if cl.GetDevice(&mut dev).is_err() {
@@ -1053,12 +1083,18 @@ pub(super) unsafe fn after_compute_dispatch(
     }
     let Some(dev) = dev else { return };
     let Some(ad) = get_device(&dev) else { return };
-    if !ad.sky_ready.load(Ordering::Acquire) {
+    let sky_ready = ad.sky_ready.load(Ordering::Acquire);
+    if !sky_ready {
         static NO_SKY: AtomicU64 = AtomicU64::new(0);
         if NO_SKY.fetch_add(1, Ordering::Relaxed) < 2 {
-            crate::xlog_info!("D3D12.X: ambient: {role:?} dispatched ({groups:?}) before sky dome capture");
+            crate::xlog_info!(
+                "D3D12.X: ambient: {role:?} dispatched ({groups:?}) before sky dome capture ({})",
+                if role == PassRole::TemporalResolve { "using least fallback" } else { "skipping" }
+            );
         }
-        return;
+        if role != PassRole::TemporalResolve {
+            return;
+        }
     }
 
     let (uav_opt, depth_opt, n_tables, n_indices, n_cbvs) = find_dispatch_views(layout, args, groups, view_heap_base);
@@ -1072,6 +1108,10 @@ pub(super) unsafe fn after_compute_dispatch(
         return;
     };
     if role == PassRole::ReflectionHistory && !typed_uav_load_supported(&dev, DXGI_FORMAT(uav_fmt)) {
+        static NO_LOAD: AtomicU64 = AtomicU64::new(0);
+        if NO_LOAD.fetch_add(1, Ordering::Relaxed) < 2 {
+            crate::xlog_info!("D3D12.X: ambient: {role:?} skipped (typed UAV load unsupported for fmt {uav_fmt})");
+        }
         return;
     }
 
@@ -1127,7 +1167,7 @@ pub(super) unsafe fn after_compute_dispatch(
     let (pso, consts) = match role {
         PassRole::TemporalResolve => (
             ad.fill_pso.as_raw(),
-            [w, h, depth_w, depth_h, has_depth, cfg.ao.to_bits(), 0, 0],
+            [w, h, depth_w, depth_h, has_depth, cfg.ao.to_bits(), sky_ready as u32, cfg.least.to_bits()],
         ),
         PassRole::ReflectionHistory => (
             ad.reflect_pso.as_raw(),
@@ -1187,6 +1227,10 @@ mod tests {
         };
         assert!(is_sky_dome_target(&rd));
 
+        // Typeless 128x128 RGBA16 render targets are copy-compatible with R16G16B16A16_FLOAT.
+        rd.Format = DXGI_FORMAT_R16G16B16A16_TYPELESS;
+        assert!(is_sky_dome_target(&rd));
+
         // Must ignore the brighter 128x128 R11G11B10_FLOAT pass to prevent frame flicker.
         rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         assert!(!is_sky_dome_target(&rd));
@@ -1194,6 +1238,10 @@ mod tests {
         rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         rd.Width = 256;
         assert!(!is_sky_dome_target(&rd));
+
+        assert!(is_ambient_compute(b"ILDN\0CS_ScreenProbes_TemporalResolve\0"));
+        assert!(is_ambient_compute(b"ILDN\0CS_UpdateHistory_16\0"));
+        assert!(!is_ambient_compute(b"ILDN\0CS_CullInstances\0"));
     }
 
     #[test]
