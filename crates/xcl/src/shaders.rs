@@ -1098,9 +1098,7 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
         "{written} program(s) written to {} (split wave64: {split}, {} windows{}, {failures} failure(s))",
         dir.display(),
         windows & !(recomp::HEAP_WINDOWS | recomp::HEAP_FLAT),
-        if windows & recomp::HEAP_WINDOWS != 0 {
-            if windows & recomp::HEAP_FLAT != 0 { " from the descriptor heap (flat)" } else { " from the descriptor heap" }
-        } else { "" }
+        if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" }
     );
     if written == wanted { 0 } else {
         eprintln!("xcl shaders --export-hlsl: requested {wanted} program(s), wrote {written}");
