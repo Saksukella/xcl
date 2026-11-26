@@ -331,15 +331,24 @@ fn hold_prelude_until_reset(allocator: usize, entry: Option<PreludeEntry>) {
 }
 
 pub(super) fn release_allocator_res(allocator: usize) {
+    // Drop overflow COM objects outside the pool locks: releasing an adopted prelude
+    // `ID3D12CommandAllocator` (or resource) re-enters `real::alloc_release` ->
+    // `console_list::allocator_reset` -> `release_allocator_res`, which would self-deadlock if
+    // `FREE_PRELUDE` / `FREE_RES` / `FREE_IO` were still held.
+    let mut drop_res = Vec::new();
     if let Some(bufs) = ALLOC_RES.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
         let mut free = FREE_RES.lock().unwrap();
         for b in bufs {
             let held: u64 = free.iter().map(|f| f.1).sum();
             if pool_keeps(free.len(), held, b.1) {
                 free.push(b);
+            } else {
+                drop_res.push(b);
             }
         }
     }
+    drop(drop_res);
+    let mut drop_io = Vec::new();
     if let Some(blocks) = ALLOC_IO.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
         let mut free = FREE_IO.lock().unwrap();
         for mut b in blocks {
@@ -347,17 +356,24 @@ pub(super) fn release_allocator_res(allocator: usize) {
             let held: u64 = free.iter().map(|f| f.cap).sum();
             if io_pool_keeps(held, b.cap) {
                 free.push(b);
+            } else {
+                drop_io.push(b);
             }
         }
     }
+    drop(drop_io);
+    let mut drop_prelude = Vec::new();
     if let Some(entries) = ALLOC_PRELUDE.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)) {
         let mut free = FREE_PRELUDE.lock().unwrap();
         for e in entries {
             if free.len() < FREE_PRELUDE_CAP {
                 free.push(e);
+            } else {
+                drop_prelude.push(e);
             }
         }
     }
+    drop(drop_prelude);
 }
 
 /// Whether `FREE_RES`, holding `count` buffers of `held` bytes, keeps one of `bytes` more.
