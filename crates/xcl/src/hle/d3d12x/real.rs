@@ -4886,7 +4886,16 @@ fn pso_trace() -> bool {
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
-    gate_driver_compile_with_threshold(kind, bytes, gate, record, huge_pso_bytes(), build)
+    gate_driver_compile_with_threshold(
+        kind,
+        bytes,
+        gate,
+        record,
+        huge_pso_bytes(),
+        || big_compile_commit_free(big_compile_headroom(bytes)),
+        super::pso_async::build_is_wanted,
+        build,
+    )
 }
 
 fn gate_driver_compile_with_threshold<R>(
@@ -4895,12 +4904,14 @@ fn gate_driver_compile_with_threshold<R>(
     gate: bool,
     record: Option<(u64, bool)>,
     huge_threshold: usize,
+    commit_free: impl Fn() -> bool,
+    wanted: impl Fn() -> bool,
     build: impl FnOnce() -> R,
 ) -> (R, std::time::Duration) {
     let gate_bytes = driver_compile_gate_bytes(kind, huge_threshold);
     let gated = gate && bytes >= gate_bytes && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gated.then(|| big_compile_turn_with(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted, is_preload_worker()));
+    let _slot = gated.then(|| big_compile_turn_with(compile_slots(bytes), commit_free, wanted, is_preload_worker()));
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5266,18 +5277,50 @@ mod big_compile_tests {
     fn medium_compute_worker_compiles_are_gated_in_medium_lane() {
         let _lock = GLOBAL_SLOTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const HUGE_THRESHOLD: usize = 256 << 10;
-        let mut held = Some(
-            (0..medium_pso_concurrency())
-                .map(|_| big_compile_turn(&MEDIUM_COMPILES, || true, || false))
-                .collect::<Vec<_>>(),
-        );
+        let can_proceed = std::sync::Arc::new(AtomicBool::new(true));
+
+        struct Cleanup {
+            held: Option<Vec<SlotGuard>>,
+            can_proceed: std::sync::Arc<AtomicBool>,
+        }
+        impl Cleanup {
+            fn release(&mut self) {
+                self.can_proceed.store(true, Ordering::Release);
+                drop(self.held.take());
+                notify_big_compile_wanted();
+            }
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        let mut cleanup = Cleanup {
+            held: Some(
+                (0..medium_pso_concurrency())
+                    .map(|_| big_compile_turn(&MEDIUM_COMPILES, || true, || false))
+                    .collect::<Vec<_>>(),
+            ),
+            can_proceed: std::sync::Arc::clone(&can_proceed),
+        };
 
         let spawn_named = |name: &str, bytes: usize, gate: bool, val: usize| {
             let (tx, rx) = std::sync::mpsc::channel();
+            let flag = std::sync::Arc::clone(&can_proceed);
             let handle = std::thread::Builder::new()
                 .name(name.into())
                 .spawn(move || {
-                    let (r, _) = gate_driver_compile_with_threshold("compute", bytes, gate, None, HUGE_THRESHOLD, || val);
+                    let (r, _) = gate_driver_compile_with_threshold(
+                        "compute",
+                        bytes,
+                        gate,
+                        None,
+                        HUGE_THRESHOLD,
+                        move || flag.load(Ordering::Acquire),
+                        || false,
+                        || val,
+                    );
                     let _ = tx.send(r);
                     r
                 })
@@ -5286,12 +5329,23 @@ mod big_compile_tests {
         };
 
         // < 128 KiB compute, cached (`gate = false`) 180 KiB compute, and title-thread 180 KiB
-        // compute all bypass `MEDIUM_COMPILES` immediately regardless of `XCL_HUGE_PSO_BYTES`.
+        // compute all bypass `MEDIUM_COMPILES` immediately regardless of `XCL_HUGE_PSO_BYTES`
+        // or host commit headroom.
         let (small_cs, small_rx) = spawn_named("xcl-pso-test", MEDIUM_COMPUTE_DRIVER_COMPILE - 1, true, 11);
         let (cached_cs, cached_rx) = spawn_named("xcl-pso-test", 180 << 10, false, 12);
         let (title_tx, title_rx) = std::sync::mpsc::channel();
+        let title_flag = std::sync::Arc::clone(&can_proceed);
         let title_cs = std::thread::spawn(move || {
-            let (r, _) = gate_driver_compile_with_threshold("compute", 180 << 10, true, None, HUGE_THRESHOLD, || 13);
+            let (r, _) = gate_driver_compile_with_threshold(
+                "compute",
+                180 << 10,
+                true,
+                None,
+                HUGE_THRESHOLD,
+                move || title_flag.load(Ordering::Acquire),
+                || false,
+                || 13,
+            );
             let _ = title_tx.send(r);
             r
         });
@@ -5305,10 +5359,14 @@ mod big_compile_tests {
         let (gated_cs, gated_rx) = spawn_named("xcl-pso-test", 180 << 10, true, 14);
         let gated_early = gated_rx.recv_timeout(Duration::from_millis(120));
 
-        // Always release `MEDIUM_COMPILES` slots BEFORE joining or asserting so no failure path can deadlock.
-        drop(held.take());
+        // Always enable `can_proceed`, release `MEDIUM_COMPILES` slots, and wake waiters BEFORE
+        // waiting/joining so every worker exits cleanly on both success and failure paths.
+        cleanup.release();
 
         let gated_res = gated_rx.recv_timeout(timeout);
+        if gated_res.is_err() {
+            cleanup.release();
+        }
         let small_join = small_cs.join().unwrap();
         let cached_join = cached_cs.join().unwrap();
         let title_join = title_cs.join().unwrap();
