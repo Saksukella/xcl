@@ -1675,10 +1675,18 @@ impl State {
             return;
         }
         let pages = std::mem::take(&mut *LAZY_COMMITS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut unmasked = false;
         for page in pages {
             if let Some(entry) = self.mapped.get_mut(&(page & !(TILE - 1))) {
+                if entry.holes == 0xFFFF {
+                    unmasked = true;
+                }
                 entry.holes = 0;
             }
+        }
+        if unmasked {
+            self.runs = None;
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -1919,22 +1927,36 @@ impl State {
     }
 }
 
+fn watchable_tile_runs(mapped: &FxHashMap<usize, TileEntry>) -> Vec<(usize, usize)> {
+    let mut tiles: Vec<usize> = mapped.iter().filter(|(_, e)| e.holes != 0xFFFF).map(|(&t, _)| t).collect();
+    tiles.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for t in tiles {
+        match runs.last_mut() {
+            Some(last) if last.1 == t => last.1 = t + TILE,
+            _ => runs.push((t, t + TILE)),
+        }
+    }
+    runs
+}
+
+/// Drain any pending VEH lazy commits so `mapped_gen()` / `mapped_ranges()` include newly
+/// CPU-committed tiles on the very first submit (zero-lock fast path when none are pending).
+pub(super) fn drain_lazy_commits_if_pending() {
+    if HAS_LAZY_COMMITS.load(Ordering::Acquire) {
+        if let Some(s) = lock_state().as_mut() {
+            s.drain_lazy_commits();
+        }
+    }
+}
+
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {
     let mut g = lock_state();
     let Some(s) = g.as_mut() else { return Vec::new() };
     if s.runs.is_none() {
-        let mut tiles: Vec<usize> = s.mapped.keys().copied().collect();
-        tiles.sort_unstable();
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for t in tiles {
-            match runs.last_mut() {
-                Some(last) if last.1 == t => last.1 = t + TILE,
-                _ => runs.push((t, t + TILE)),
-            }
-        }
-        s.runs = Some(runs);
+        s.runs = Some(watchable_tile_runs(&s.mapped));
     }
     s.runs.clone().unwrap_or_default()
 }
@@ -3168,5 +3190,21 @@ mod tests {
             assert!(!crate::hle::kernelx::lazy::unmark(p), "page must already have been committed by VEH");
             assert_ne!(VirtualFree(p as *mut c_void, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn watchable_tile_runs_omits_vram_only_holes_until_unmasked() {
+        let mut mapped: FxHashMap<usize, TileEntry> = FxHashMap::default();
+        let t0 = 0x1000_0000usize;
+        let t1 = t0 + TILE;
+        let t2 = t1 + TILE;
+        mapped.insert(t0, TileEntry::with_holes((0, 0), 0));
+        mapped.insert(t1, TileEntry::with_holes((0, 1), 0xFFFF));
+        mapped.insert(t2, TileEntry::with_holes((0, 2), 0x00FF));
+
+        assert_eq!(watchable_tile_runs(&mapped), vec![(t0, t0 + TILE), (t2, t2 + TILE)]);
+
+        mapped.get_mut(&t1).unwrap().holes = 0;
+        assert_eq!(watchable_tile_runs(&mapped), vec![(t0, t2 + TILE)]);
     }
 }
