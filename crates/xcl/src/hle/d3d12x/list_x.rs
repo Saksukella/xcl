@@ -1256,6 +1256,11 @@ pub(super) fn has_list_state(list: usize) -> bool {
     LISTS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
 }
 
+#[cfg(test)]
+pub(super) fn tracked_allocator_for_test(list: usize) -> Option<usize> {
+    LISTS.lock().unwrap().as_ref()?.get(&list).map(|s| s.allocator)
+}
+
 /// Forget a released command allocator so `KickoffX` will not reset a list with a dead allocator.
 pub(super) fn on_allocator_release(alloc: usize) {
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
