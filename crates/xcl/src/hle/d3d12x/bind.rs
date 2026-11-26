@@ -657,24 +657,24 @@ pub(super) fn rebind_allocator(list: *mut c_void, allocator: usize) {
         s.pc_abi_cs = AbiBound::default();
         s.arg_order_clean = false;
         s.inline_guard = None;
-        s.prelude_built = None;
-        if s.allocator == backing {
-            for sl in &mut s.scratch {
-                sl.state = D3D12_RESOURCE_STATE_COMMON;
-            }
-            return (0, Vec::new(), Vec::new(), Vec::new(), None);
-        }
-        let old = std::mem::replace(&mut s.allocator, backing);
-        s.arena = Default::default();
-        s.scratch = Default::default();
-        s.scratch_next = 0;
-        s.scratch_taken = 0;
         s.prelude_scratch = Default::default();
         s.prelude_bufs.clear();
         s.prelude_guards.clear();
         s.prelude_scales.clear();
         s.prelude_draws.clear();
         let prelude = s.prelude_owned.take();
+        s.prelude_built = None;
+        if s.allocator == backing {
+            for sl in &mut s.scratch {
+                sl.state = D3D12_RESOURCE_STATE_COMMON;
+            }
+            return (backing, Vec::new(), Vec::new(), Vec::new(), prelude);
+        }
+        let old = std::mem::replace(&mut s.allocator, backing);
+        s.arena = Default::default();
+        s.scratch = Default::default();
+        s.scratch_next = 0;
+        s.scratch_taken = 0;
         s.dummy_res_va = 0;
         s.dummy_table_p = 0;
         s.io_cache_gfx = None;

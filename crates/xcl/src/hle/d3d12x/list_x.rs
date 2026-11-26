@@ -1152,6 +1152,16 @@ unsafe fn try_native_depth_bias(list: *mut c_void, bias: DepthBias) -> bool {
 /// # Safety
 /// `list` must be null or a valid `ID3D12GraphicsCommandList` COM pointer.
 pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_COMMAND_LIST_TYPE) {
+    on_create_with_backing(list, alloc, alloc, pso, ty);
+}
+
+pub unsafe fn on_create_with_backing(
+    list: *mut c_void,
+    title_alloc: usize,
+    pc_alloc: usize,
+    pso: usize,
+    ty: D3D12_COMMAND_LIST_TYPE,
+) {
     if list.is_null() {
         return;
     }
@@ -1174,8 +1184,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
                 WRITE64_SIGNAL_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        super::alloc_pool::created_on(key, alloc, ty.0);
-        m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
+        super::alloc_pool::created_on(key, pc_alloc, ty.0);
+        m.insert(key, ListState { allocator: title_alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
     };
     drop(old);
