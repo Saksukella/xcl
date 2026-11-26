@@ -4656,4 +4656,40 @@ pub(crate) mod tests {
         assert_eq!(s[0], LOOP_BUDGET);
         assert_eq!(v[0][1], LOOP_BUDGET);
     }
+
+    #[test]
+    fn nested_loops_share_loop_budget_across_headers() {
+        // Outer infinite loop (header at inst 2, counted in s0) wrapping an inner loop that
+        // runs K = 3 times per outer iteration (header at inst 4, counted in s1 per outer
+        // trip and accumulated in s2 / v1 across all outer trips). Both headers decrement
+        // the same shared Var::Budget initialized at entry, so total header trips (s0 + s2)
+        // equal LOOP_BUDGET rather than LOOP_BUDGET * 3 or hanging on reinitialization.
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 128)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 128)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
+            ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 1), ("SSRC1", 131)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFB)]),
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFF8)]),
+        ];
+        let (mut s, mut v) = state(32);
+        s[0] = 0;
+        s[1] = 0;
+        s[2] = 0;
+        s[126] = 1; // lane 0 active so the CPU interpreter finishes well within its step limit
+        v[0][1] = 0;
+        let (s, v) = run(lines, false, &s, &v);
+        let full_outer = LOOP_BUDGET / 4;
+        let rem = LOOP_BUDGET % 4;
+        let expected_outer = full_outer + u32::from(rem > 0);
+        let expected_inner = full_outer * 3 + rem.saturating_sub(1);
+        assert_eq!(s[0], expected_outer);
+        assert_eq!(s[2], expected_inner);
+        assert_eq!(s[0] + s[2], LOOP_BUDGET);
+        assert_eq!(v[0][1], expected_inner);
+    }
 }
