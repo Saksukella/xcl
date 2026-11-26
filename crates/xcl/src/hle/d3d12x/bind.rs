@@ -269,9 +269,17 @@ const INLINE_GUARD_BATCH_MAX: u32 = 256;
 const INLINE_GUARD_JOBS_BYTES: usize = 16 + INLINE_GUARD_BATCH_MAX as usize * 32;
 const INLINE_GUARD_DST_BYTES: u64 = INLINE_GUARD_BATCH_MAX as u64 * 256;
 
+fn parse_inline_guard_batch(val: Option<&str>) -> bool {
+    val.is_some_and(|v| v.trim() == "1")
+}
+
+/// Opt-in inline 256-slot guard batching (`XCL_INLINE_GUARD_BATCH=1`). Defaults off because
+/// `execute_indirect` clears `s.inline_guard` after each dispatch (so batching never exceeds 1)
+/// while allocating 64 KiB scratch + 8 KiB coherent UMA per dispatch and triggering page faults on
+/// AMD RDNA4; the default `guard_indirect_heap_pipeline` uses 32-bit root constants and 256 B scratch.
 fn inline_guard_batch_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_INLINE_GUARD_BATCH").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| parse_inline_guard_batch(std::env::var("XCL_INLINE_GUARD_BATCH").ok().as_deref()))
 }
 
 /// A recording's blocks of rewritten indirect arguments, and most bytes of them (past it, its
@@ -4754,6 +4762,15 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn inline_guard_batch_defaults_off_and_opts_in() {
+        assert!(!parse_inline_guard_batch(None));
+        assert!(!parse_inline_guard_batch(Some("0")));
+        assert!(!parse_inline_guard_batch(Some("")));
+        assert!(parse_inline_guard_batch(Some("1")));
+        assert!(parse_inline_guard_batch(Some(" 1 ")));
+    }
 
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
