@@ -883,19 +883,27 @@ fn resolve_cbv_va(va: usize) -> usize {
     }
 }
 
-/// Scan up to `max_bytes` (capped at 2048 B) of readable constant-buffer memory at `va` in
-/// 256-byte chunks and feed candidate bindless descriptor indices `< MAX_SLOT_INDEX` into `push_idx`.
-unsafe fn scan_cbv_indices(va: usize, max_bytes: usize, push_idx: &mut impl FnMut(u32)) {
-    let va = resolve_cbv_va(va);
+/// Scan up to `max_bytes` (capped at 2048 B) of readable constant-buffer memory at `va`,
+/// resolving each chunk (capped at 256 B and never crossing a 64 KiB mirror page boundary)
+/// through `resolve`, and feed candidate bindless descriptor indices `< MAX_SLOT_INDEX` into `push_idx`.
+unsafe fn scan_cbv_indices_with(
+    va: usize,
+    max_bytes: usize,
+    mut resolve: impl FnMut(usize) -> usize,
+    push_idx: &mut impl FnMut(u32),
+) {
     if va == 0 || max_bytes < 4 {
         return;
     }
+    const PAGE: usize = crate::hle::kernelx::mirrors::PAGE;
     let total = max_bytes.min(2048);
     let mut off = 0usize;
     while off < total {
-        let chunk = (total - off).min(256);
-        let base = va + off;
-        if !crate::gpu::shader::readable(base, chunk) {
+        let Some(cur_va) = va.checked_add(off) else { break };
+        let to_page_end = PAGE - (cur_va & (PAGE - 1));
+        let chunk = (total - off).min(256).min(to_page_end);
+        let base = resolve(cur_va);
+        if base == 0 || !crate::gpu::shader::readable(base, chunk) {
             break;
         }
         let words = chunk / 4;
@@ -907,6 +915,12 @@ unsafe fn scan_cbv_indices(va: usize, max_bytes: usize, push_idx: &mut impl FnMu
         }
         off += chunk;
     }
+}
+
+/// Scan up to `max_bytes` (capped at 2048 B) of readable constant-buffer memory at `va` in
+/// page-bounded chunks and feed candidate bindless descriptor indices `< MAX_SLOT_INDEX` into `push_idx`.
+unsafe fn scan_cbv_indices(va: usize, max_bytes: usize, push_idx: &mut impl FnMut(u32)) {
+    scan_cbv_indices_with(va, max_bytes, resolve_cbv_va, push_idx);
 }
 
 /// Inspect a compute dispatch's bound descriptor tables, SM 6.6 directly-indexed view heap
@@ -1323,5 +1337,45 @@ mod tests {
         }
         forget_resource(res_a);
         note_descriptor(cpu_slot_b, 0, 0, 0, 0, false);
+    }
+
+    #[test]
+    fn scan_cbv_indices_resolves_each_64k_mirror_page_independently() {
+        const PAGE: usize = crate::hle::kernelx::mirrors::PAGE;
+        // Backing page 0 sits right before a readable decoy slice; backing page 1 is separate.
+        let mut backing0_and_decoy = vec![0u32; 128];
+        backing0_and_decoy[0] = 101_001; // sentinel in page 0 (last 256 B of GPU page 0)
+        backing0_and_decoy[64] = 999_999; // decoy immediately after backing 0 (must NEVER be read)
+        let mut backing1 = vec![0u32; 64];
+        backing1[0] = 202_002; // sentinel in page 1 (first 256 B of GPU page 1)
+
+        let gpu_page0 = 0x5000_0000usize;
+        let gpu_page1 = gpu_page0 + PAGE;
+        let cbv_start = gpu_page0 + (PAGE - 256); // 0xff00: spans 256 B on page 0 + 256 B on page 1
+        let p0_base = backing0_and_decoy.as_ptr() as usize;
+        let p1_base = backing1.as_ptr() as usize;
+
+        let mut seen = Vec::new();
+        unsafe {
+            scan_cbv_indices_with(
+                cbv_start,
+                512,
+                |va| {
+                    if va >= gpu_page0 && va < gpu_page1 {
+                        p0_base + (va - cbv_start)
+                    } else if va >= gpu_page1 && va < gpu_page1 + 256 {
+                        p1_base + (va - gpu_page1)
+                    } else {
+                        0
+                    }
+                },
+                &mut |v| seen.push(v),
+            );
+        }
+        assert!(seen.contains(&101_001), "first 64 KiB page sentinel must be read");
+        assert!(seen.contains(&202_002), "second 64 KiB page sentinel must be resolved independently");
+        assert!(!seen.contains(&999_999), "readable decoy past backing 0 must never be read across 64 KiB boundary");
+        assert_eq!(resolve_cbv_va(0), 0);
+        assert_eq!(resolve_cbv_va(p1_base), p1_base);
     }
 }
