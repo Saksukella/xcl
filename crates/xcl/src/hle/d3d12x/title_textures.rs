@@ -548,11 +548,21 @@ fn is_small_cpu_filled_target(w: u64, h: u32, samples: u32, flags: u32) -> bool 
 }
 
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
-pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+pub(super) unsafe fn register(
+    device: *mut c_void,
+    res: *mut c_void,
+    va: usize,
+    desc: &[u8; 0x38],
+    state: D3D12_RESOURCE_STATES,
+    precomputed_tex: Option<Arc<xg::Texture>>,
+) -> Result<(), String> {
     // (a new texture object, or the address of an old one again: its first upload is not left out)
     LAST_CONTENT.lock().unwrap().remove(&(res as usize));
     STREAM_RECHECK.lock().unwrap().remove(&(res as usize));
-    let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+    let tex = match precomputed_tex {
+        Some(t) => t,
+        None => Arc::new(xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?),
+    };
     // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
     // title's bytes are not the resource's texels
     if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
@@ -599,7 +609,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         va,
         src,
         in_gpu_view,
-        tex: Arc::new(tex),
+        tex,
         states: vec![state],
         pending: true,
         gpu_written: false,
@@ -2699,7 +2709,7 @@ mod tests {
             ).unwrap();
             let texture: ID3D12Resource = texture.unwrap();
             let key = texture.as_raw() as usize;
-            register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON).unwrap();
+            register(raw_device, texture.as_raw(), va, &console, D3D12_RESOURCE_STATE_COMMON, None).unwrap();
             let _registered = RegisteredTexture(key);
             for value in [0x3D, 0x9A] {
                 std::ptr::write_bytes(src as *mut u8, value, PAGE);
@@ -3943,5 +3953,28 @@ mod tests {
 
         assert!(t.mark_gpu_written(0x100));
         assert!(t.watchable_ranges().is_empty());
+    }
+
+    #[test]
+    fn register_reuses_precomputed_xg_texture_arc() {
+        let mut desc = [0u8; 0x38];
+        desc[0..4].copy_from_slice(&3u32.to_le_bytes()); // Texture2D
+        desc[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        desc[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        desc[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        desc[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        desc[0x20..0x24].copy_from_slice(&28u32.to_le_bytes()); // RGBA8
+        desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        let pre = Arc::new(xg::Texture::new(&desc).unwrap());
+        let fake_res = 0xDEAD_BEEF_1234usize as *mut c_void;
+        unsafe {
+            register(std::ptr::null_mut(), fake_res, 0x7000_0000, &desc, D3D12_RESOURCE_STATE_COMMON, Some(Arc::clone(&pre))).unwrap();
+        }
+        let stored = {
+            let t = TEXTURES.lock().unwrap();
+            Arc::clone(&t.by_res.get(&(fake_res as usize)).expect("registered entry").tex)
+        };
+        assert!(Arc::ptr_eq(&pre, &stored), "register must reuse precomputed Arc<xg::Texture> without recomputing");
+        let _ = forget(fake_res as usize);
     }
 }

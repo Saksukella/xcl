@@ -254,6 +254,7 @@ unsafe fn release_raw_com(raw: usize) {
 pub(super) fn forget_for_recycle(resource: usize, held: bool) -> Option<RecycleInfo> {
     let placed = PLACED_TEXTURES.write().unwrap().as_mut().is_some_and(|textures| textures.remove(&resource));
     if !placed {
+        super::vram_small::forget_fallback(resource);
         return None;
     }
     let info = if super::vram_small::forget(resource) {

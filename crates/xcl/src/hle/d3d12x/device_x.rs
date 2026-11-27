@@ -1130,18 +1130,20 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
     let mut placed_hr = None;
     let mut pc_tex_desc: Option<D3D12_RESOURCE_DESC> = None;
-    let mut water_tex: Option<(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, u32, u32, crate::hle::xg::Texture)> = None;
+    let mut water_tex: Option<(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, u32, u32, std::sync::Arc<crate::hle::xg::Texture>)> = None;
+    let mut xg_tex: Option<std::sync::Arc<crate::hle::xg::Texture>> = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
         pc_tex_desc = Some(pc);
         let timer = place_times::step(Step::Desc);
-        let xg_tex = crate::hle::xg::Texture::new(&x).ok();
-        let console_bytes = xg_tex.as_ref().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        let tex = crate::hle::xg::Texture::new(&x).ok().map(std::sync::Arc::new);
+        let console_bytes = tex.as_ref().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if console_bytes.is_some() && super::cpu_writes::is_water_readback_desc(&pc) {
-            if let Some(t) = xg_tex {
+            if let Some(t) = tex.clone() {
                 water_tex = Some((pc.Format, pc.Width as u32, pc.Height, t));
             }
         }
+        xg_tex = tex;
         drop(timer);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
@@ -1153,7 +1155,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                     super::depth_uav::register_if_depth_uav(this, *ppv, &x, state, console_state);
                     super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc, flags, state);
                     if let Some((fmt, w, h, t)) = water_tex {
-                        super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, w, h, std::sync::Arc::new(t));
+                        super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, w, h, t);
                     } else if super::cpu_writes::has_water_readback() {
                         super::cpu_writes::unregister_water_readback(*ppv as usize);
                     }
@@ -1167,13 +1169,19 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let hr = match placed_hr {
         Some(hr) => hr,
         None => {
-            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-            real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
+            let pc_desc = pc_tex_desc.unwrap_or_else(|| std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC));
+            match super::vram_small::place_fallback(this, &pc_desc, state, clear, riid, ppv) {
+                Some(hr) => hr,
+                None => {
+                    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+                    real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
+                }
+            }
         }
     };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         if let Some((fmt, w, h, t)) = water_tex {
-            super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, w, h, std::sync::Arc::new(t));
+            super::cpu_writes::register_water_readback(*ppv as usize, va as usize, fmt, w, h, t);
         } else if super::cpu_writes::has_water_readback() {
             super::cpu_writes::unregister_water_readback(*ppv as usize);
         }
@@ -1184,7 +1192,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         static M: AtomicU64 = AtomicU64::new(0);
         if !aliased_to_gpu {
             let timer = place_times::step(Step::Register);
-            let registered = super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32));
+            let registered = super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32), xg_tex);
             drop(timer);
             match registered {
                 Ok(()) => {

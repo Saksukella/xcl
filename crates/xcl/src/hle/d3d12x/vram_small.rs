@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -305,13 +306,252 @@ pub(super) fn forget(resource: usize) -> bool {
     false
 }
 
-/// `(used_bytes, pool_bytes)` across all devices.
+/// 64 KiB allocation unit (`D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT`) for default-heap fallback resources.
+const FALLBACK_UNIT: usize = 0x1_0000;
+/// Largest fallback resource pooled here: 4 MiB (`64 * 64 KiB`).
+const FALLBACK_MAX_UNITS: u32 = 64;
+/// Units per shared 16 MiB default fallback heap (`256 * 64 KiB`).
+const FALLBACK_POOL_UNITS: u32 = 256;
+
+/// Sub-allocated 16 MiB `D3D12_HEAP_TYPE_DEFAULT` heaps (`D3D12_HEAP_FLAG_NONE`, ResourceHeapTier 2)
+/// replacing per-resource `CreateCommittedResource` calls on the non-reservable fallback path
+/// (e.g., `TEXTURE1D`, 3D packed-mip textures, and small non-UMA buffers).
+struct DefaultFallbackPools<H> {
+    pools: Vec<Pool<H>>,
+    /// Per-size-class (`1..=FALLBACK_MAX_UNITS`) reusable blocks `(pool, offset)`.
+    free: [Vec<(u32, u32)>; (FALLBACK_MAX_UNITS as usize) + 1],
+    /// Released blocks waiting `COOL` before reuse so in-flight GPU work finishes.
+    cooling: VecDeque<(Block, Instant)>,
+    /// Live resource raw pointer -> `(pool, offset_units, size_units)`.
+    resources: HashMap<usize, Block>,
+    /// Total 64 KiB units currently backing live resources.
+    used_units: usize,
+}
+
+impl<H: Clone> DefaultFallbackPools<H> {
+    fn new() -> Self {
+        DefaultFallbackPools {
+            pools: Vec::new(),
+            free: std::array::from_fn(|_| Vec::new()),
+            cooling: VecDeque::new(),
+            resources: HashMap::new(),
+            used_units: 0,
+        }
+    }
+
+    fn drain_cooling(&mut self, now: Instant) {
+        while self.cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL) {
+            if let Some(((pool, offset, units), _)) = self.cooling.pop_front() {
+                self.free[units as usize].push((pool, offset));
+            }
+        }
+    }
+
+    fn try_acquire(&mut self, units: u32, now: Instant) -> Option<(H, Block)> {
+        debug_assert!((1..=FALLBACK_MAX_UNITS).contains(&units));
+        self.drain_cooling(now);
+        let (pool, offset) = if let Some(b) = self.free[units as usize].pop() {
+            b
+        } else if let Some((idx, p)) = self.pools.iter_mut().enumerate().rev().find(|(_, p)| p.next_unit + units <= FALLBACK_POOL_UNITS) {
+            let off = p.next_unit;
+            p.next_unit += units;
+            (idx as u32, off)
+        } else {
+            return None;
+        };
+        let heap = self.pools[pool as usize].heap.clone();
+        self.used_units += units as usize;
+        Some((heap, (pool, offset, units)))
+    }
+
+    fn add_pool_and_acquire(&mut self, heap: H, units: u32, now: Instant) -> (H, Block) {
+        if let Some(got) = self.try_acquire(units, now) {
+            return got;
+        }
+        let pool_idx = self.pools.len() as u32;
+        self.pools.push(Pool { heap, next_unit: 0 });
+        if let Some(got) = self.try_acquire(units, now) {
+            return got;
+        }
+        unreachable!("fresh fallback pool {pool_idx} must fit {units} units");
+    }
+
+    fn rollback(&mut self, block: Block) {
+        self.used_units -= block.2 as usize;
+        self.free[block.2 as usize].push((block.0, block.1));
+    }
+
+    fn note_resource(&mut self, res: usize, block: Block) {
+        self.resources.insert(res, block);
+    }
+
+    fn forget(&mut self, res: usize, now: Instant) -> bool {
+        let Some(block) = self.resources.remove(&res) else {
+            return false;
+        };
+        self.used_units -= block.2 as usize;
+        self.cooling.push_back((block, now));
+        true
+    }
+
+    fn bytes(&self) -> (usize, usize) {
+        (self.used_units * FALLBACK_UNIT, self.pools.len() * FALLBACK_POOL_UNITS as usize * FALLBACK_UNIT)
+    }
+}
+
+unsafe impl Send for DefaultFallbackPools<ID3D12Heap> {}
+
+static FALLBACK_POOLS: Mutex<BTreeMap<usize, DefaultFallbackPools<ID3D12Heap>>> = Mutex::new(BTreeMap::new());
+static FALLBACK_LIVE: AtomicUsize = AtomicUsize::new(0);
+static TIER2_CACHE: Mutex<BTreeMap<usize, bool>> = Mutex::new(BTreeMap::new());
+
+fn fallback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_VRAM_FALLBACK_POOL").map_or(true, |v| v.trim() != "0"))
+}
+
+fn tier2_cached(dev: &ID3D12Device) -> bool {
+    let dev_key = dev.as_raw() as usize;
+    if let Some(&ok) = TIER2_CACHE.lock().unwrap().get(&dev_key) {
+        return ok;
+    }
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let ok = unsafe {
+        dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_ok()
+            && opts.ResourceHeapTier.0 >= 2
+    };
+    TIER2_CACHE.lock().unwrap().insert(dev_key, ok);
+    ok
+}
+
+fn fallback_candidate(desc: &D3D12_RESOURCE_DESC) -> bool {
+    let max_bytes = FALLBACK_MAX_UNITS as u64 * FALLBACK_UNIT as u64;
+    if desc.SampleDesc.Count > 1 {
+        return false;
+    }
+    match desc.Dimension {
+        D3D12_RESOURCE_DIMENSION_BUFFER => desc.Width > 0 && desc.Width <= max_bytes,
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D => true,
+        _ => false,
+    }
+}
+
+/// Place a non-reservable fallback resource (`TEXTURE1D`, packed-mip 3D texture, small non-UMA buffer, etc.)
+/// into a shared 16 MiB `D3D12_HEAP_TYPE_DEFAULT` heap via `CreatePlacedResource` instead of paying a
+/// per-resource `CreateCommittedResource` WDDM allocation. Returns `None` to fall back to `CreateCommittedResource`.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn place_fallback(
+    this: *mut c_void,
+    desc: &D3D12_RESOURCE_DESC,
+    state: u32,
+    clear: *const c_void,
+    riid: *const windows_sys::core::GUID,
+    ppv: *mut *mut c_void,
+) -> Option<HRESULT> {
+    if !fallback_enabled() || !fallback_candidate(desc) {
+        return None;
+    }
+    let dev = ID3D12Device::from_raw_borrowed(&this)?;
+    if !tier2_cached(dev) {
+        return None;
+    }
+    let placed_desc = D3D12_RESOURCE_DESC { Alignment: 0, ..*desc };
+    let info = dev.GetResourceAllocationInfo(0, &[placed_desc]);
+    if info.SizeInBytes == u64::MAX || info.SizeInBytes == 0 || info.Alignment == 0 || info.Alignment > FALLBACK_UNIT as u64 {
+        return None;
+    }
+    let units = (info.SizeInBytes as usize).div_ceil(FALLBACK_UNIT) as u32;
+    if !(1..=FALLBACK_MAX_UNITS).contains(&units) {
+        return None;
+    }
+    let dev_key = dev.as_raw() as usize;
+    let now = Instant::now();
+
+    let (heap, block) = {
+        let mut g = FALLBACK_POOLS.lock().unwrap();
+        let pools = g.entry(dev_key).or_insert_with(DefaultFallbackPools::new);
+        pools.try_acquire(units, now)
+    }
+    .or_else(|| {
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: FALLBACK_POOL_UNITS as u64 * FALLBACK_UNIT as u64,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64,
+            Flags: D3D12_HEAP_FLAG_NONE,
+        };
+        let mut new_heap: Option<ID3D12Heap> = None;
+        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&heap_desc, &mut new_heap)) {
+            crate::xlog_warn!("D3D12.X: default fallback pool CreateHeap: {e}");
+            return None;
+        }
+        let new_heap = new_heap?;
+        let mut g = FALLBACK_POOLS.lock().unwrap();
+        let pools = g.entry(dev_key).or_insert_with(DefaultFallbackPools::new);
+        Some(pools.add_pool_and_acquire(new_heap, units, Instant::now()))
+    })?;
+
+    let hr = super::real::dev_create_placed_resource(
+        this,
+        heap.as_raw() as usize,
+        block.1 as usize * FALLBACK_UNIT,
+        &placed_desc as *const _ as usize,
+        state as usize,
+        clear as usize,
+        riid,
+        ppv,
+    );
+    if hr < 0 || (*ppv).is_null() {
+        let mut g = FALLBACK_POOLS.lock().unwrap();
+        if let Some(pools) = g.get_mut(&dev_key) {
+            pools.rollback(block);
+        }
+        return None;
+    }
+    let raw = *ppv as usize;
+    FALLBACK_POOLS.lock().unwrap().entry(dev_key).or_insert_with(DefaultFallbackPools::new).note_resource(raw, block);
+    FALLBACK_LIVE.fetch_add(1, Ordering::Release);
+    Some(hr)
+}
+
+/// Release a default-fallback-pool resource on COM release.
+pub(super) fn forget_fallback(resource: usize) -> bool {
+    if FALLBACK_LIVE.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let mut g = FALLBACK_POOLS.lock().unwrap();
+    let now = Instant::now();
+    for pools in g.values_mut() {
+        if pools.forget(resource, now) {
+            FALLBACK_LIVE.fetch_sub(1, Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
+/// `(used_bytes, pool_bytes)` across all devices (4 KiB small pools + 64 KiB default fallback pools).
 pub(super) fn bytes() -> (usize, usize) {
-    let g = SMALL_POOLS.lock().unwrap();
-    g.values().fold((0, 0), |(used, pools), p| {
-        let (u, t) = p.bytes();
-        (used + u, pools + t)
-    })
+    let (su, sp) = {
+        let g = SMALL_POOLS.lock().unwrap();
+        g.values().fold((0, 0), |(used, pools), p| {
+            let (u, t) = p.bytes();
+            (used + u, pools + t)
+        })
+    };
+    let (fu, fp) = {
+        let g = FALLBACK_POOLS.lock().unwrap();
+        g.values().fold((0, 0), |(used, pools), p| {
+            let (u, t) = p.bytes();
+            (used + u, pools + t)
+        })
+    };
+    (su + fu, sp + fp)
+}
+
+#[cfg(test)]
+pub(super) fn fallback_bytes_for(device: usize) -> (usize, usize) {
+    let g = FALLBACK_POOLS.lock().unwrap();
+    g.get(&device).map_or((0, 0), DefaultFallbackPools::bytes)
 }
 
 #[cfg(test)]
@@ -596,6 +836,288 @@ mod tests {
             let sampled_view = place_sampled(rt_va, &rgba, 16384);
             assert_eq!(bytes_for(dev_key).0, small_before_alias, "sampled view over live GPU target must alias vram::Pages, not vram_small");
             drop((sampled_view, rt));
+        }
+    }
+
+    #[test]
+    fn fallback_pool_packs_cools_recycles_and_rolls_back() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p: DefaultFallbackPools<u32> = DefaultFallbackPools::new();
+        let alloc = |p: &mut DefaultFallbackPools<u32>, units: u32, res: usize, now: Instant| -> (u32, Block) {
+            let (h, b) = p.try_acquire(units, now).unwrap_or_else(|| {
+                let id = p.pools.len() as u32;
+                p.add_pool_and_acquire(id, units, now)
+            });
+            p.note_resource(res, b);
+            (h, b)
+        };
+
+        // 8 x 64 KiB resources pack contiguously into 512 KiB of pool 0.
+        for i in 0..8usize {
+            let (h, b) = alloc(&mut p, 1, 1000 + i, at(0));
+            assert_eq!((h, b), (0, (0, i as u32, 1)));
+        }
+        assert_eq!(p.bytes(), (8 * FALLBACK_UNIT, FALLBACK_POOL_UNITS as usize * FALLBACK_UNIT));
+
+        // Release resource 1003; must stay in cooling until COOL (2s) elapses.
+        assert!(p.forget(1003, at(100)));
+        assert_eq!(p.bytes().0, 7 * FALLBACK_UNIT);
+        let (_, b_wait) = alloc(&mut p, 1, 1100, at(1500));
+        assert_eq!(b_wait, (0, 8, 1), "still cooling at +1.4s, must not reuse yet");
+        let (_, b_rec) = alloc(&mut p, 1, 1101, at(2200));
+        assert_eq!(b_rec, (0, 3, 1), "block (0, 3, 1) recycled after COOL");
+
+        // Rollback on creation failure returns the block immediately to the free list.
+        let (_, b_fail) = p.try_acquire(4, at(2300)).unwrap();
+        assert_eq!(b_fail, (0, 9, 4));
+        p.rollback(b_fail);
+        let (_, b_reused) = alloc(&mut p, 4, 1102, at(2300));
+        assert_eq!(b_reused, (0, 9, 4));
+
+        // Concurrent CreateHeap race: add_pool_and_acquire reuses existing room without pushing an empty pool.
+        let pools_before = p.pools.len();
+        let (h_raced, _) = p.add_pool_and_acquire(999, 2, at(2400));
+        assert_eq!(h_raced, 0);
+        assert_eq!(p.pools.len(), pools_before, "must not push redundant fallback pool when room exists");
+    }
+
+    #[test]
+    fn fallback_candidate_filters_msaa_and_oversized_buffers() {
+        let mut buf = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 4096,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        assert!(fallback_candidate(&buf));
+        buf.Width = (FALLBACK_MAX_UNITS as u64 * FALLBACK_UNIT as u64) + 1;
+        assert!(!fallback_candidate(&buf), "buffers > 4 MiB stay committed");
+        buf.Width = 0;
+        assert!(!fallback_candidate(&buf));
+
+        let mut tex1d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        assert!(fallback_candidate(&tex1d));
+        tex1d.SampleDesc.Count = 4;
+        assert!(!fallback_candidate(&tex1d), "MSAA requires 4 MiB alignment");
+    }
+
+    #[test]
+    fn gpu_fallback_pool_places_texture1d_and_small_buffers_cleanly() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let mut dev: Option<ID3D12Device> = None;
+            for (adapter, _) in crate::gpu::adapter::candidates(&factory, &sel) {
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() && dev.is_some() {
+                    break;
+                }
+            }
+            let Some(dev) = dev else {
+                crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                return;
+            };
+            if !tier2_cached(&dev) {
+                crate::gpu::recomp::runner::skip_test("resource heap tier < 2");
+                return;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let dev_key = dev.as_raw() as usize;
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+
+            let (used0, _) = fallback_bytes_for(dev_key);
+            let tex1d_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let mut p1 = std::ptr::null_mut();
+            let hr1 = place_fallback(dev.as_raw(), &tex1d_desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p1);
+            assert!(hr1.is_some_and(|h| h >= 0) && !p1.is_null(), "TEXTURE1D fallback placement failed: {hr1:x?}");
+            assert!(!super::super::vram::is_placed_texture(p1 as usize), "fallback pool resources must preserve non-shared committed semantics");
+            let r1 = ID3D12Resource::from_raw(p1);
+
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let mut p2 = std::ptr::null_mut();
+            let hr2 = place_fallback(dev.as_raw(), &buf_desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p2);
+            assert!(hr2.is_some_and(|h| h >= 0) && !p2.is_null(), "small buffer fallback placement failed: {hr2:x?}");
+            assert!(!super::super::vram::is_placed_texture(p2 as usize));
+            let r2 = ID3D12Resource::from_raw(p2);
+
+            let (used1, pool1) = fallback_bytes_for(dev_key);
+            assert_eq!(used1 - used0, 2 * FALLBACK_UNIT, "TEXTURE1D + 4 KiB buffer must consume 2 x 64 KiB fallback units");
+            assert!(pool1 >= FALLBACK_POOL_UNITS as usize * FALLBACK_UNIT);
+            drop((r2, r1));
+            let (used2, _) = fallback_bytes_for(dev_key);
+            assert_eq!(used2, used0, "COM release must return both fallback blocks via forget_fallback");
+        }
+    }
+
+    /// Offline D3D12 microbenchmark: measures (1) `CreateCommittedResource` vs `DefaultFallbackPools::place_fallback`
+    /// (`CreatePlacedResource` into 16 MiB heap) for TEXTURE1D + small fallback buffers, and
+    /// (2) double `xg::Texture::new` vs deduplicated single `xg::Texture::new` + `Arc::clone`.
+    #[test]
+    #[ignore]
+    fn bench_fallback_pool_vs_committed_and_xg_dedup() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory1().expect("DXGI factory");
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let mut dev: Option<ID3D12Device> = None;
+            for (adapter, _) in crate::gpu::adapter::candidates(&factory, &sel) {
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).is_ok() && dev.is_some() {
+                    break;
+                }
+            }
+            let dev = dev.expect("D3D12 device");
+            assert!(tier2_cached(&dev), "requires ResourceHeapTier >= 2");
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+
+            let tex1d_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE1D,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+                ..Default::default()
+            };
+            let heap_props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+
+            // Warm up one heap in DefaultFallbackPools so steady-state placement is measured.
+            let mut warm = std::ptr::null_mut();
+            let _ = place_fallback(dev.as_raw(), &tex1d_desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut warm);
+            if !warm.is_null() {
+                drop(ID3D12Resource::from_raw(warm));
+            }
+
+            const N: usize = 256;
+            let t_committed = Instant::now();
+            let mut committed_res = Vec::with_capacity(N);
+            for i in 0..N {
+                let d = if i % 2 == 0 { &tex1d_desc } else { &buf_desc };
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::real::dev_create_committed_resource(
+                    dev.as_raw(),
+                    &heap_props as *const _ as usize,
+                    0,
+                    d as *const _ as usize,
+                    D3D12_RESOURCE_STATE_COMMON.0 as usize,
+                    0,
+                    riid,
+                    &mut p,
+                );
+                assert!(hr >= 0 && !p.is_null(), "CreateCommittedResource failed: {hr:#x}");
+                committed_res.push(ID3D12Resource::from_raw(p));
+            }
+            let committed_us = t_committed.elapsed().as_micros() as f64;
+            drop(committed_res);
+
+            let t_pooled = Instant::now();
+            let mut pooled_res = Vec::with_capacity(N);
+            for i in 0..N {
+                let d = if i % 2 == 0 { &tex1d_desc } else { &buf_desc };
+                let mut p = std::ptr::null_mut();
+                let hr = place_fallback(dev.as_raw(), d, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr.is_some_and(|h| h >= 0) && !p.is_null(), "place_fallback failed: {hr:x?}");
+                pooled_res.push(ID3D12Resource::from_raw(p));
+            }
+            let pooled_us = t_pooled.elapsed().as_micros() as f64;
+            drop(pooled_res);
+
+            let speedup_alloc = committed_us / pooled_us.max(1.0);
+            println!(
+                "BENCH Opt B ({N}x mixed TEXTURE1D+Buffer): CreateCommittedResource={:.2} ms ({:.2} us/op) vs place_fallback={:.2} ms ({:.2} us/op) => {:.2}x speedup",
+                committed_us / 1000.0, committed_us / N as f64, pooled_us / 1000.0, pooled_us / N as f64, speedup_alloc
+            );
+
+            // Opt A microbenchmark: 1000x double xg::Texture::new vs single xg::Texture::new + Arc::clone
+            let mut console = [0u8; 0x38];
+            console[0..4].copy_from_slice(&3u32.to_le_bytes()); // Texture2D
+            console[0x10..0x18].copy_from_slice(&1024u64.to_le_bytes());
+            console[0x18..0x1C].copy_from_slice(&1024u32.to_le_bytes());
+            console[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            console[0x1E..0x20].copy_from_slice(&10u16.to_le_bytes()); // 10 mips
+            console[0x20..0x24].copy_from_slice(&71u32.to_le_bytes()); // BC1_UNORM
+            console[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            const M: usize = 2000;
+            let t_double = Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..M {
+                let a = crate::hle::xg::Texture::new(&console).unwrap();
+                let b = crate::hle::xg::Texture::new(&console).unwrap();
+                acc = acc.wrapping_add(a.size() ^ b.size());
+            }
+            let double_us = t_double.elapsed().as_micros() as f64;
+
+            let t_dedup = Instant::now();
+            for _ in 0..M {
+                let a = std::sync::Arc::new(crate::hle::xg::Texture::new(&console).unwrap());
+                let b = std::sync::Arc::clone(&a);
+                acc = acc.wrapping_add(a.size() ^ b.size());
+            }
+            let dedup_us = t_dedup.elapsed().as_micros() as f64;
+            std::hint::black_box(acc);
+
+            let speedup_xg = double_us / dedup_us.max(1.0);
+            println!(
+                "BENCH Opt A ({M}x 1024x1024 10-mip BC1 xg::Texture::new): double={:.2} ms ({:.2} us/op) vs dedup={:.2} ms ({:.2} us/op) => {:.2}x speedup",
+                double_us / 1000.0, double_us / M as f64, dedup_us / 1000.0, dedup_us / M as f64, speedup_xg
+            );
         }
     }
 }
