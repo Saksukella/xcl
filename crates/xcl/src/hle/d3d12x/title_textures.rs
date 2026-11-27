@@ -479,15 +479,30 @@ pub(super) fn note_list_closed(list: *mut c_void) {
     CLOSED.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(list as usize, (now_us(), false));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookHint {
+    /// Direct `refresh()` without `decide_look()` (e.g. `KickoffX`): always sweep cold chunks.
+    DirectFull,
+    /// `decide_look()` saw all lists closed before the last look in the same frame.
+    Skip,
+    /// `decide_look()` saw fresh lists needing a look (may skip cold chunks mid-frame if tiered).
+    Normal,
+    /// `decide_look()` saw a resubmitted or untracked list, empty lists, or `XCL_LOOK_SKIP=0`:
+    /// force a full look including cold chunks even when `XCL_WRITE_WATCH_TIER=1`.
+    ForceFull,
+}
+
 thread_local! {
-    /// The next `refresh` on this thread may leave its look out (`look_needed_for` said so).
-    static SKIP_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Hint from `decide_look` for the next `refresh` on this thread; resets to `DirectFull`
+    /// after each `refresh_once` so direct callers (`KickoffX`) always sweep cold chunks.
+    static LOOK_HINT: std::cell::Cell<LookHint> = const { std::cell::Cell::new(LookHint::DirectFull) };
 }
 
 /// Before a submit of `lists`: whether its refresh needs a look of its own (then `refresh` looks;
 /// else it is told to leave it out). The lists count as submitted from here on.
 pub(super) fn decide_look(lists: &[*mut c_void]) {
     if !look_skip_on() {
+        LOOK_HINT.with(|c| c.set(LookHint::ForceFull));
         return;
     }
     let began = LOOK_BEGAN_US.load(Ordering::Acquire);
@@ -495,19 +510,33 @@ pub(super) fn decide_look(lists: &[*mut c_void]) {
     let mut g = CLOSED.lock().unwrap();
     let m = g.get_or_insert_with(std::collections::HashMap::new);
     let mut skip = began != 0 && same_frame && !lists.is_empty();
+    let mut force_full = lists.is_empty();
     for &l in lists {
         match m.get_mut(&(l as usize)) {
             Some((closed, submitted)) => {
-                if *submitted || *closed >= began {
+                if *submitted {
+                    skip = false;
+                    force_full = true;
+                } else if *closed >= began {
                     skip = false;
                 }
                 *submitted = true;
             }
-            None => skip = false,
+            None => {
+                skip = false;
+                force_full = true;
+            }
         }
     }
     drop(g);
-    SKIP_LOOK.with(|c| c.set(skip));
+    let hint = if skip {
+        LookHint::Skip
+    } else if force_full {
+        LookHint::ForceFull
+    } else {
+        LookHint::Normal
+    };
+    LOOK_HINT.with(|c| c.set(hint));
     static SKIPPED: AtomicU64 = AtomicU64::new(0);
     static ALL: AtomicU64 = AtomicU64::new(0);
     let all = ALL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -529,13 +558,14 @@ const WATCH_CHUNK: usize = 16 << 20;
 /// Consecutive zero-dirty looks before a 16 MiB watch chunk cools down.
 const COLD_THRESHOLD: u16 = 16;
 
-/// `XCL_WRITE_WATCH_TIER` (on by default, `0`: off): 16 MiB chunked Hot/Cold write-watch
-/// tiering. Cold chunks (static world textures / sparse geometry with 0 dirty pages for
-/// `COLD_THRESHOLD` consecutive looks) are skipped on mid-frame submits and swept on the first
-/// submit of each frame (`!same_frame`), immediately promoting back to Hot when dirtied.
+/// `XCL_WRITE_WATCH_TIER` (off by default, `1`: on): opt-in 16 MiB chunked Hot/Cold write-watch
+/// tiering. Cold chunks (0 dirty pages for `COLD_THRESHOLD` consecutive looks) are skipped on
+/// normal mid-frame submits and swept on the first submit of each frame (`!same_frame`), on
+/// repeated-list resubmits, and on direct `refresh()` calls (`KickoffX`), immediately promoting
+/// back to Hot when dirtied.
 fn write_watch_tier_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_WRITE_WATCH_TIER").map_or(true, |v| v.trim() != "0"))
+    *ON.get_or_init(|| std::env::var("XCL_WRITE_WATCH_TIER").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// `XCL_COLD_WATCH_STRIDE` (default `1`: full cold sweep every frame): optional round-robin
@@ -617,23 +647,26 @@ impl WatchTierState {
         self.cold_looks.retain(|k, _| live.contains(k));
     }
 
-    /// Scan active chunks for `frame`. When `tier_on` is true, cold chunks are skipped on
-    /// mid-frame submits (`frame == last_cold_sweep_frame`) and swept on the first submit of each
-    /// frame (all of them when `stride == 1`, or `1/stride` round-robin). Returns `(scanned, skipped_cold)`.
+    /// Scan active chunks for `frame`. When `tier_on` is true and `force_cold` is false, cold
+    /// chunks are skipped on mid-frame submits (`frame == last_cold_sweep_frame`) and swept on
+    /// the first submit of each frame (all of them when `stride == 1`, or `1/stride` round-robin).
+    /// When `force_cold` is true (repeated-list resubmit or direct `refresh()`), all cold chunks
+    /// are scanned without advancing `cold_sweep_seq`. Returns `(scanned, skipped_cold)`.
     fn scan_chunks<F>(
         &mut self,
         chunks: &[(usize, usize)],
         frame: u64,
         tier_on: bool,
         stride: u64,
+        force_cold: bool,
         mut scan_one: F,
     ) -> (usize, usize)
     where
         F: FnMut(usize, usize) -> bool,
     {
         let stride = stride.max(1);
-        let sweep_cold = !tier_on || frame != self.last_cold_sweep_frame;
-        let cold_slot = if sweep_cold && tier_on && stride > 1 {
+        let sweep_cold = !tier_on || force_cold || frame != self.last_cold_sweep_frame;
+        let cold_slot = if sweep_cold && tier_on && !force_cold && stride > 1 {
             let slot = self.cold_sweep_seq % stride;
             self.cold_sweep_seq = self.cold_sweep_seq.wrapping_add(1);
             Some(slot)
@@ -1112,7 +1145,8 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     wanted.extend(super::sparse::gpu_view::sources());
     // the sources of buffer mirrors: a draw copies only the pages written (`list_x::copy_written`)
     wanted.extend(super::list_x::mirror_sources());
-    let computed = Arc::new(chunk_watch_ranges(&watch_ranges(&regions, wanted)));
+    let merged = watch_ranges(&regions, wanted);
+    let computed = Arc::new(if write_watch_tier_on() { chunk_watch_ranges(&merged) } else { merged });
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
 }
@@ -1164,7 +1198,9 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 unsafe fn refresh_once(queue: *mut c_void) {
     reclaim_completed_on_queue(queue as usize);
     // (taken first: a return below must not leave it for the next submit on this thread)
-    let skip_look = SKIP_LOOK.with(|c| c.replace(false));
+    let look_hint = LOOK_HINT.with(|c| c.replace(LookHint::DirectFull));
+    let skip_look = look_hint == LookHint::Skip;
+    let force_cold = matches!(look_hint, LookHint::DirectFull | LookHint::ForceFull);
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -1193,7 +1229,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     let buckets = std::mem::take(&mut *PROMOTED_BUCKETS.lock().unwrap());
                     tiers.promote_buckets(&buckets);
                 }
-                tiers.scan_chunks(&ranges, look_frame, write_watch_tier_on(), cold_watch_stride(), |base, size| {
+                tiers.scan_chunks(&ranges, look_frame, write_watch_tier_on(), cold_watch_stride(), force_cold, |base, size| {
                     let before = dirty.len();
                     take_written(base, size, &mut buf, &mut dirty, &mut page);
                     dirty.len() > before
@@ -4162,14 +4198,14 @@ mod tests {
 
         // Cool c0 over COLD_THRESHOLD looks across frames so it becomes Cold.
         for f in 0..COLD_THRESHOLD as u64 {
-            tiers.scan_chunks(&[c0], f, true, 1, |_, _| false);
+            tiers.scan_chunks(&[c0], f, true, 1, false, |_, _| false);
         }
         assert!(tiers.is_cold(c0), "c0 must be Cold after COLD_THRESHOLD clean looks");
 
         // Mid-frame submit on the same frame with a brand-new chunk c1:
         // c0 is skipped (Cold, same_frame), while new chunk c1 starts Hot and IS scanned!
         let mut scanned = Vec::new();
-        let (n_scanned, n_skipped) = tiers.scan_chunks(&[c0, c1], (COLD_THRESHOLD - 1) as u64, true, 1, |b, s| {
+        let (n_scanned, n_skipped) = tiers.scan_chunks(&[c0, c1], (COLD_THRESHOLD - 1) as u64, true, 1, false, |b, s| {
             scanned.push((b, s));
             false
         });
@@ -4180,7 +4216,7 @@ mod tests {
         tiers.promote_buckets(&[c0.0 >> 24]);
         assert!(!tiers.is_cold(c0), "promoted bucket must immediately return to Hot");
         scanned.clear();
-        tiers.scan_chunks(&[c0, c1], (COLD_THRESHOLD - 1) as u64, true, 1, |b, s| {
+        tiers.scan_chunks(&[c0, c1], (COLD_THRESHOLD - 1) as u64, true, 1, false, |b, s| {
             scanned.push((b, s));
             false
         });
@@ -4196,14 +4232,14 @@ mod tests {
 
         // 1. Run COLD_THRESHOLD looks where hot_c is always dirty and cold_c is always clean.
         for f in 0..COLD_THRESHOLD as u64 {
-            tiers.scan_chunks(&chunks, f, true, 1, |b, _| b == hot_c.0);
+            tiers.scan_chunks(&chunks, f, true, 1, false, |b, _| b == hot_c.0);
         }
         assert!(!tiers.is_cold(hot_c));
         assert!(tiers.is_cold(cold_c));
 
         // 2. Mid-frame submit (same frame = COLD_THRESHOLD - 1): only hot_c is scanned, cold_c skipped.
         let mut seen = Vec::new();
-        let (sc, sk) = tiers.scan_chunks(&chunks, (COLD_THRESHOLD - 1) as u64, true, 1, |b, _| {
+        let (sc, sk) = tiers.scan_chunks(&chunks, (COLD_THRESHOLD - 1) as u64, true, 1, false, |b, _| {
             seen.push(b);
             b == hot_c.0
         });
@@ -4212,7 +4248,7 @@ mod tests {
 
         // 3. First submit of next frame: cold_c IS swept, reports dirty, and immediately promotes back to Hot!
         seen.clear();
-        let (sc, sk) = tiers.scan_chunks(&chunks, COLD_THRESHOLD as u64, true, 1, |b, _| {
+        let (sc, sk) = tiers.scan_chunks(&chunks, COLD_THRESHOLD as u64, true, 1, false, |b, _| {
             seen.push(b);
             true // cold_c now has a dirty write
         });
@@ -4222,11 +4258,123 @@ mod tests {
 
         // 4. Subsequent mid-frame submit on the same frame scans BOTH chunks because cold_c is now Hot.
         seen.clear();
-        tiers.scan_chunks(&chunks, COLD_THRESHOLD as u64, true, 1, |b, _| {
+        tiers.scan_chunks(&chunks, COLD_THRESHOLD as u64, true, 1, false, |b, _| {
             seen.push(b);
             false
         });
         assert_eq!(seen, vec![hot_c.0, cold_c.0]);
+    }
+
+    #[test]
+    fn same_frame_cold_write_updates_before_present_by_default() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGE: usize = 0x1000;
+        let len = 2 * WATCH_CHUNK;
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let chunks = chunk_watch_ranges(&[(base, len)]);
+            let mut buf = vec![std::ptr::null_mut::<c_void>(); 1024];
+            let mut dirty = Vec::new();
+            let mut page = PAGE as u32;
+            take_written(base, len, &mut buf, &mut dirty, &mut page);
+
+            // 1. Default mode (`tier_on = false`): even after COLD_THRESHOLD clean looks on frame 0,
+            //    a mid-frame write to the second chunk is caught immediately on frame 0 before Present.
+            let mut tiers_default = WatchTierState::new();
+            for _ in 0..COLD_THRESHOLD {
+                dirty.clear();
+                tiers_default.scan_chunks(&chunks, 0, false, 1, false, |b, s| {
+                    let before = dirty.len();
+                    take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
+            }
+            let target = base + WATCH_CHUNK + PAGE;
+            std::ptr::write_volatile(target as *mut u8, 0x7E);
+            dirty.clear();
+            tiers_default.scan_chunks(&chunks, 0, false, 1, false, |b, s| {
+                let before = dirty.len();
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+                dirty.len() > before
+            });
+            assert!(dirty.contains(&target), "default mode must catch same-frame cold writes before Present");
+
+            // 2. Opt-in tiered mode (`tier_on = true`, even with `stride = 4`): a forced cold sweep
+            //    (`force_cold = true`, used for resubmitted closed lists and direct `KickoffX` refresh)
+            //    catches same-frame cold writes immediately and promotes the chunk back to Hot.
+            let mut tiers_opt_in = WatchTierState::new();
+            for f in 0..COLD_THRESHOLD as u64 {
+                dirty.clear();
+                tiers_opt_in.scan_chunks(&chunks, f, true, 1, false, |b, s| {
+                    let before = dirty.len();
+                    take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    dirty.len() > before
+                });
+            }
+            let same_frame = (COLD_THRESHOLD - 1) as u64;
+            assert!(tiers_opt_in.is_cold(chunks[1]));
+            std::ptr::write_volatile(target as *mut u8, 0x8F);
+            dirty.clear();
+            let (scanned, skipped) = tiers_opt_in.scan_chunks(&chunks, same_frame, true, 4, true, |b, s| {
+                let before = dirty.len();
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+                dirty.len() > before
+            });
+            assert_eq!((scanned, skipped), (chunks.len(), 0), "force_cold must sweep all chunks regardless of stride");
+            assert!(dirty.contains(&target), "force_cold must catch same-frame cold writes before Present");
+            assert!(!tiers_opt_in.is_cold(chunks[1]), "dirtied cold chunk must promote back to Hot");
+
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn decide_look_forces_full_sweep_on_resubmitted_list_and_direct_refresh() {
+        // Without a prior `decide_look()`, a direct `refresh()` (e.g. `KickoffX`) sees `DirectFull`.
+        LOOK_HINT.with(|c| c.set(LookHint::DirectFull));
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::DirectFull);
+
+        let frame = super::super::present::presents();
+        let list_a = 0xDEAD_BEEF_0001usize as *mut c_void;
+        let list_b = 0xDEAD_BEEF_0002usize as *mut c_void;
+        let list_unknown = 0xDEAD_BEEF_0003usize as *mut c_void;
+
+        // Close list_a BEFORE the last look began -> Skip on first submit, ForceFull on resubmit!
+        note_list_closed(list_a);
+        let after_a = now_us() + 1;
+        LOOK_BEGAN_US.store(after_a, Ordering::Release);
+        LOOK_FRAME.store(frame, Ordering::Release);
+
+        decide_look(&[list_a]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::Skip);
+
+        // Resubmitting the same closed list in the same frame must force a full cold sweep.
+        decide_look(&[list_a]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::ForceFull);
+
+        // A freshly closed list after `LOOK_BEGAN_US` yields Normal (not ForceFull).
+        note_list_closed(list_b);
+        if let Some(m) = CLOSED.lock().unwrap().as_mut() {
+            if let Some((closed, _)) = m.get_mut(&(list_b as usize)) {
+                *closed = after_a + 1;
+            }
+        }
+        decide_look(&[list_b]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::Normal);
+
+        // An untracked list or empty slice conservatively forces a full cold sweep.
+        decide_look(&[list_unknown]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::ForceFull);
+        decide_look(&[]);
+        assert_eq!(LOOK_HINT.with(|c| c.replace(LookHint::DirectFull)), LookHint::ForceFull);
+
+        // Clean up synthetic test pointers from CLOSED.
+        if let Some(m) = CLOSED.lock().unwrap().as_mut() {
+            m.remove(&(list_a as usize));
+            m.remove(&(list_b as usize));
+        }
     }
 
     #[test]
@@ -4259,7 +4407,8 @@ mod tests {
             }
 
             let legacy_ranges = watch_ranges_with_gap(&regions, wanted.clone(), 64 << 20);
-            let fix_a_chunks = chunk_watch_ranges(&watch_ranges_with_gap(&regions, wanted.clone(), WATCH_GAP));
+            let default_4m_ranges = watch_ranges_with_gap(&regions, wanted.clone(), WATCH_GAP);
+            let fix_a_chunks = chunk_watch_ranges(&default_4m_ranges);
 
             let legacy_bytes: usize = legacy_ranges.iter().map(|&(_, s)| s).sum();
             let fix_a_bytes: usize = fix_a_chunks.iter().map(|&(_, s)| s).sum();
@@ -4315,7 +4464,29 @@ mod tests {
             }
             let base_ms = base_dur.as_secs_f64() * 1000.0;
 
-            // Drain any residual writes before Fix A measurement.
+            // Default (4 MiB gap, tier=OFF): risk-free default path (no 16 MiB chunk splitting).
+            dirty.clear();
+            for &(b, s) in &regions {
+                take_written(b, s, &mut buf, &mut dirty, &mut page);
+            }
+            let mut default_dur = std::time::Duration::ZERO;
+            for frame in 0..FRAMES {
+                for sub in 0..SUBMITS_PER_FRAME {
+                    dirty_hot_pages(500 + frame * SUBMITS_PER_FRAME + sub);
+                    if sub == 4 {
+                        continue;
+                    }
+                    dirty.clear();
+                    let t0 = std::time::Instant::now();
+                    for &(b, s) in &default_4m_ranges {
+                        take_written(b, s, &mut buf, &mut dirty, &mut page);
+                    }
+                    default_dur += t0.elapsed();
+                }
+            }
+            let default_ms = default_dur.as_secs_f64() * 1000.0;
+
+            // Drain any residual writes before opt-in tiered measurement.
             dirty.clear();
             for &(b, s) in &regions {
                 take_written(b, s, &mut buf, &mut dirty, &mut page);
@@ -4326,14 +4497,14 @@ mod tests {
             for pre in 0..COLD_THRESHOLD as u64 {
                 dirty_hot_pages(pre);
                 dirty.clear();
-                tiers_s1.scan_chunks(&fix_a_chunks, pre, true, 1, |b, s| {
+                tiers_s1.scan_chunks(&fix_a_chunks, pre, true, 1, false, |b, s| {
                     let before = dirty.len();
                     take_written(b, s, &mut buf, &mut dirty, &mut page);
                     dirty.len() > before
                 });
             }
 
-            // Fix A (stride=1): 4 MiB gap + 16 MiB Hot/Cold tiering, full cold sweep on frame start.
+            // Opt-in tier=ON (stride=1): 4 MiB gap + 16 MiB Hot/Cold tiering, full cold sweep on frame start.
             // Also inject a cold write into Arena B's last island on frame 10 mid-frame and verify 0 missed pages at frame 11!
             let cold_probe_addr = arena_b + 15 * (24 << 20) + PAGE;
             let mut cold_probe_caught = false;
@@ -4350,7 +4521,7 @@ mod tests {
                     }
                     dirty.clear();
                     let t0 = std::time::Instant::now();
-                    tiers_s1.scan_chunks(&fix_a_chunks, 100 + frame, true, 1, |b, s| {
+                    tiers_s1.scan_chunks(&fix_a_chunks, 100 + frame, true, 1, false, |b, s| {
                         let before = dirty.len();
                         take_written(b, s, &mut buf, &mut dirty, &mut page);
                         dirty.len() > before
@@ -4365,7 +4536,7 @@ mod tests {
             let fix_s1_ms = fix_s1_dur.as_secs_f64() * 1000.0;
             assert!(cold_probe_caught, "cold write injected mid-frame 10 must be caught at frame 11 boundary");
 
-            // Fix A (stride=4) measurement for reference:
+            // Opt-in tier=ON (stride=4) measurement for reference:
             dirty.clear();
             for &(b, s) in &regions {
                 take_written(b, s, &mut buf, &mut dirty, &mut page);
@@ -4374,7 +4545,7 @@ mod tests {
             for pre in 0..COLD_THRESHOLD as u64 {
                 dirty_hot_pages(pre);
                 dirty.clear();
-                tiers_s4.scan_chunks(&fix_a_chunks, pre, true, 1, |b, s| {
+                tiers_s4.scan_chunks(&fix_a_chunks, pre, true, 1, false, |b, s| {
                     let before = dirty.len();
                     take_written(b, s, &mut buf, &mut dirty, &mut page);
                     dirty.len() > before
@@ -4389,7 +4560,7 @@ mod tests {
                     }
                     dirty.clear();
                     let t0 = std::time::Instant::now();
-                    tiers_s4.scan_chunks(&fix_a_chunks, 200 + frame, true, 4, |b, s| {
+                    tiers_s4.scan_chunks(&fix_a_chunks, 200 + frame, true, 4, false, |b, s| {
                         let before = dirty.len();
                         take_written(b, s, &mut buf, &mut dirty, &mut page);
                         dirty.len() > before
@@ -4401,7 +4572,7 @@ mod tests {
 
             let total_submits = (FRAMES * SUBMITS_PER_FRAME) as f64;
             println!(
-                "BENCH write-watch ({} frames x {} submits = {} submits, {} non-skipped looks, legacy_watched={} MiB, fix_a_watched={} MiB):",
+                "BENCH write-watch ({} frames x {} submits = {} submits, {} non-skipped looks, legacy_watched={} MiB, default_4m_watched={} MiB):",
                 FRAMES,
                 SUBMITS_PER_FRAME,
                 FRAMES * SUBMITS_PER_FRAME,
@@ -4416,14 +4587,21 @@ mod tests {
                 base_ms / base_looks as f64,
             );
             println!(
-                "  Fix A (4 MiB gap, stride=1)     : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
+                "  Default  (4 MiB gap, tier=OFF)  : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
+                default_ms,
+                default_ms / total_submits,
+                default_ms / base_looks as f64,
+                base_ms / default_ms.max(0.001),
+            );
+            println!(
+                "  Opt-in   (4 MiB gap, stride=1)  : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
                 fix_s1_ms,
                 fix_s1_ms / total_submits,
                 fix_s1_ms / fix_s1_looks as f64,
                 base_ms / fix_s1_ms.max(0.001),
             );
             println!(
-                "  Fix A (4 MiB gap, stride=4)     : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
+                "  Opt-in   (4 MiB gap, stride=4)  : {:.2} ms total | {:.3} ms/submit | {:.3} ms/look | speedup: {:.2}x",
                 fix_s4_ms,
                 fix_s4_ms / total_submits,
                 fix_s4_ms / fix_s1_looks as f64,
