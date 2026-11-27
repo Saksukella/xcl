@@ -2301,54 +2301,66 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     // Memory-writing producer compute PSOs (`!spared && !bvh_traversal`) are never skipped by the
     // per-frame graphics wait window: skipping a producer dispatch leaves title memory/tables
     // uninitialized and causes Window-3 pointer corruption several frames later.
-    let fcap = if p.compute { None } else { frame_budget_for(frame_budget_policy(), frame) };
+    let fcap = frame_budget_for_kind(frame_budget_policy(), p.compute, frame);
     resolve_wait_in(&p, pso, budget, fcap, frame, &FRAME_BUDGET_GFX)
 }
 
-/// Default per-frame graphics pipeline wait window during boot/menu loading (`12 s`).
+/// Default per-frame graphics pipeline wait window (`12 s`).
 const DEFAULT_FRAME_BUDGET_MS: u64 = 12_000;
-/// Low-latency per-frame graphics wait window (`32 ms`) once active presentation is underway.
-const GAMEPLAY_FRAME_BUDGET_MS: u64 = 32;
-/// Presented-frame threshold after which the automatic graphics wait budget switches from boot
-/// loading (`12 s`) to low-latency gameplay (`32 ms`).
+/// Presented-frame threshold after which an opt-in `XCL_GFX_PSO_FRAME_BUDGET_MS` cap takes effect
+/// for graphics-only bind waits, leaving initial boot/menu frames at `DEFAULT_FRAME_BUDGET_MS`.
 const GAMEPLAY_FRAME_BUDGET_START_FRAME: u64 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameBudgetPolicy {
-    /// Explicit override via `XCL_PSO_FRAME_BUDGET_MS` or `XCL_GFX_PSO_FRAME_BUDGET_MS`.
+    /// Default policy when neither env var is set: keeps `DEFAULT_FRAME_BUDGET_MS` (`12 s`)
+    /// across all frames so cold graphics pipelines are never prematurely skipped during loading.
+    Default,
+    /// Explicit override via `XCL_PSO_FRAME_BUDGET_MS`: applies uniformly across all frames.
     Explicit(Option<std::time::Duration>),
-    /// Automatic default: `DEFAULT_FRAME_BUDGET_MS` during boot/menu frames
-    /// (`frame < GAMEPLAY_FRAME_BUDGET_START_FRAME`), then `GAMEPLAY_FRAME_BUDGET_MS`.
-    Dynamic,
+    /// Opt-in override via `XCL_GFX_PSO_FRAME_BUDGET_MS`: keeps `DEFAULT_FRAME_BUDGET_MS` while
+    /// `frame < GAMEPLAY_FRAME_BUDGET_START_FRAME`, then caps graphics-only bind waits.
+    OptInGameplay(Option<std::time::Duration>),
 }
 
-/// Parses `XCL_PSO_FRAME_BUDGET_MS` / `XCL_GFX_PSO_FRAME_BUDGET_MS` into a `FrameBudgetPolicy`.
-fn parse_frame_budget_policy(val: Option<&str>) -> FrameBudgetPolicy {
-    let Some(raw) = val.map(str::trim).filter(|s| !s.is_empty()) else {
-        return FrameBudgetPolicy::Dynamic;
-    };
+fn parse_budget_override(val: Option<&str>) -> Option<Option<std::time::Duration>> {
+    let raw = val.map(str::trim).filter(|s| !s.is_empty())?;
     if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
-        return FrameBudgetPolicy::Explicit(None);
+        return Some(None);
     }
-    match raw.parse::<u64>() {
-        Ok(ms) => FrameBudgetPolicy::Explicit(Some(std::time::Duration::from_millis(ms))),
-        Err(_) => FrameBudgetPolicy::Dynamic,
+    raw.parse::<u64>().ok().map(|ms| Some(std::time::Duration::from_millis(ms)))
+}
+
+/// Parses `XCL_PSO_FRAME_BUDGET_MS` (uniform override) and `XCL_GFX_PSO_FRAME_BUDGET_MS`
+/// (opt-in post-boot graphics cap) into a `FrameBudgetPolicy`.
+fn parse_frame_budget_policy_from(pso_env: Option<&str>, gfx_env: Option<&str>) -> FrameBudgetPolicy {
+    if let Some(cap) = parse_budget_override(pso_env) {
+        return FrameBudgetPolicy::Explicit(cap);
     }
+    if let Some(cap) = parse_budget_override(gfx_env) {
+        return FrameBudgetPolicy::OptInGameplay(cap);
+    }
+    FrameBudgetPolicy::Default
 }
 
 /// Effective graphics pipeline wait window for `frame` under `policy`.
 fn frame_budget_for(policy: FrameBudgetPolicy, frame: u64) -> Option<std::time::Duration> {
     match policy {
+        FrameBudgetPolicy::Default => Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS)),
         FrameBudgetPolicy::Explicit(cap) => cap,
-        FrameBudgetPolicy::Dynamic => {
-            let ms = if frame < GAMEPLAY_FRAME_BUDGET_START_FRAME {
-                DEFAULT_FRAME_BUDGET_MS
+        FrameBudgetPolicy::OptInGameplay(cap) => {
+            if frame < GAMEPLAY_FRAME_BUDGET_START_FRAME {
+                Some(std::time::Duration::from_millis(DEFAULT_FRAME_BUDGET_MS))
             } else {
-                GAMEPLAY_FRAME_BUDGET_MS
-            };
-            Some(std::time::Duration::from_millis(ms))
+                cap
+            }
         }
     }
+}
+
+/// Effective per-frame wait cap for a pipeline bind: producer compute pipelines are never capped.
+fn frame_budget_for_kind(policy: FrameBudgetPolicy, compute: bool, frame: u64) -> Option<std::time::Duration> {
+    if compute { None } else { frame_budget_for(policy, frame) }
 }
 
 /// Parses `XCL_PSO_FRAME_BUDGET_MS` for frame 0 (boot/default): unset/empty defaults to
@@ -2356,27 +2368,15 @@ fn frame_budget_for(policy: FrameBudgetPolicy, frame: u64) -> Option<std::time::
 /// and a positive integer sets the per-frame graphics wait window in milliseconds.
 #[cfg(test)]
 fn parse_frame_budget(val: Option<&str>) -> Option<std::time::Duration> {
-    frame_budget_for(parse_frame_budget_policy(val), 0)
+    frame_budget_for(parse_frame_budget_policy_from(val, None), 0)
 }
 
 fn frame_budget_policy() -> FrameBudgetPolicy {
     static B: OnceLock<FrameBudgetPolicy> = OnceLock::new();
     *B.get_or_init(|| {
-        let primary = std::env::var("XCL_PSO_FRAME_BUDGET_MS").ok();
-        let raw = primary
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                std::env::var("XCL_GFX_PSO_FRAME_BUDGET_MS")
-                    .ok()
-                    .and_then(|v| {
-                        let t = v.trim();
-                        (!t.is_empty()).then(|| t.to_owned())
-                    })
-            });
-        parse_frame_budget_policy(raw.as_deref())
+        let pso_env = std::env::var("XCL_PSO_FRAME_BUDGET_MS").ok();
+        let gfx_env = std::env::var("XCL_GFX_PSO_FRAME_BUDGET_MS").ok();
+        parse_frame_budget_policy_from(pso_env.as_deref(), gfx_env.as_deref())
     })
 }
 
@@ -3240,29 +3240,42 @@ mod pso_queue_tests {
     }
 
     #[test]
-    fn dynamic_frame_budget_transitions_after_boot_and_honors_explicit_override() {
+    fn frame_budget_keeps_default_12s_and_honors_opt_in_gfx_and_explicit_overrides() {
         let ms = std::time::Duration::from_millis;
 
-        // Default (unset/empty/invalid): 12 s during boot/menus, 32 ms once active frames flow.
-        let dyn_policy = parse_frame_budget_policy(None);
-        assert_eq!(dyn_policy, FrameBudgetPolicy::Dynamic);
-        assert_eq!(parse_frame_budget_policy(Some("")), FrameBudgetPolicy::Dynamic);
-        assert_eq!(parse_frame_budget_policy(Some("bad")), FrameBudgetPolicy::Dynamic);
-        assert_eq!(frame_budget_for(dyn_policy, 0), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
-        assert_eq!(frame_budget_for(dyn_policy, GAMEPLAY_FRAME_BUDGET_START_FRAME - 1), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
-        assert_eq!(frame_budget_for(dyn_policy, GAMEPLAY_FRAME_BUDGET_START_FRAME), Some(ms(GAMEPLAY_FRAME_BUDGET_MS)));
-        assert_eq!(frame_budget_for(dyn_policy, 10_000), Some(ms(GAMEPLAY_FRAME_BUDGET_MS)));
+        // Default (unset/empty/invalid): keeps 12 s across all frames (even >60) so cold
+        // graphics PSOs during menus or world entry are never prematurely skipped.
+        let default_policy = parse_frame_budget_policy_from(None, None);
+        assert_eq!(default_policy, FrameBudgetPolicy::Default);
+        assert_eq!(parse_frame_budget_policy_from(Some(""), Some("")), FrameBudgetPolicy::Default);
+        assert_eq!(parse_frame_budget_policy_from(Some("bad"), Some("bad")), FrameBudgetPolicy::Default);
+        for frame in [0, GAMEPLAY_FRAME_BUDGET_START_FRAME - 1, GAMEPLAY_FRAME_BUDGET_START_FRAME, 10_000] {
+            assert_eq!(frame_budget_for_kind(default_policy, false, frame), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
+            assert_eq!(frame_budget_for_kind(default_policy, true, frame), None);
+        }
 
-        // Explicit numeric / zero / off overrides apply uniformly across both boot and gameplay.
-        let explicit_500 = parse_frame_budget_policy(Some("500"));
-        assert_eq!(frame_budget_for(explicit_500, 0), Some(ms(500)));
-        assert_eq!(frame_budget_for(explicit_500, 10_000), Some(ms(500)));
-        let explicit_zero = parse_frame_budget_policy(Some("0"));
-        assert_eq!(frame_budget_for(explicit_zero, 0), Some(ms(0)));
-        assert_eq!(frame_budget_for(explicit_zero, 10_000), Some(ms(0)));
-        let explicit_off = parse_frame_budget_policy(Some("off"));
-        assert_eq!(frame_budget_for(explicit_off, 0), None);
-        assert_eq!(frame_budget_for(explicit_off, 10_000), None);
+        // Opt-in XCL_GFX_PSO_FRAME_BUDGET_MS=32: keeps 12 s before frame 60, caps graphics to
+        // 32 ms from frame 60 onward, while leaving producer compute pipelines uncapped.
+        let opt_in_32 = parse_frame_budget_policy_from(None, Some("32"));
+        assert_eq!(opt_in_32, FrameBudgetPolicy::OptInGameplay(Some(ms(32))));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, 0), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, GAMEPLAY_FRAME_BUDGET_START_FRAME - 1), Some(ms(DEFAULT_FRAME_BUDGET_MS)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, GAMEPLAY_FRAME_BUDGET_START_FRAME), Some(ms(32)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, false, 10_000), Some(ms(32)));
+        assert_eq!(frame_budget_for_kind(opt_in_32, true, GAMEPLAY_FRAME_BUDGET_START_FRAME), None);
+        assert_eq!(frame_budget_for_kind(opt_in_32, true, 10_000), None);
+
+        // Explicit XCL_PSO_FRAME_BUDGET_MS applies uniformly across all frames and overrides opt-in.
+        let explicit_500 = parse_frame_budget_policy_from(Some("500"), Some("32"));
+        assert_eq!(frame_budget_for_kind(explicit_500, false, 0), Some(ms(500)));
+        assert_eq!(frame_budget_for_kind(explicit_500, false, 10_000), Some(ms(500)));
+        assert_eq!(frame_budget_for_kind(explicit_500, true, 10_000), None);
+        let explicit_zero = parse_frame_budget_policy_from(Some("0"), None);
+        assert_eq!(frame_budget_for_kind(explicit_zero, false, 0), Some(ms(0)));
+        assert_eq!(frame_budget_for_kind(explicit_zero, false, 10_000), Some(ms(0)));
+        let explicit_off = parse_frame_budget_policy_from(Some("off"), Some("32"));
+        assert_eq!(frame_budget_for_kind(explicit_off, false, 0), None);
+        assert_eq!(frame_budget_for_kind(explicit_off, false, 10_000), None);
     }
 
     #[test]
