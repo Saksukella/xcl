@@ -290,6 +290,7 @@ pub(super) unsafe fn recycle_ready(resource: usize) -> bool {
         if info.was_mapped {
             if let Some(res) = ID3D12Resource::from_raw_borrowed(&(resource as *mut c_void)) {
                 pages.unmap(res, info.total);
+                pages.flush_signal();
             }
         }
         pages.reserved_pool.push(info.key, resource, info.total, info.levels)
@@ -941,12 +942,12 @@ impl PoolHeaps {
         }
     }
 
-    fn take_heap(&mut self, idx: u32) -> Option<ID3D12Heap> {
-        self.zero_bufs.get_mut(idx as usize).map(|b| b.take());
+    fn take_heap(&mut self, idx: u32) -> Option<(ID3D12Heap, Option<ID3D12Resource>)> {
+        let zero_buf = self.zero_bufs.get_mut(idx as usize).and_then(|b| b.take());
         let h = self.slots.get_mut(idx as usize)?.take()?;
         self.live -= 1;
         self.free_slots.push(idx);
-        Some(h)
+        Some((h, zero_buf))
     }
 
     unsafe fn zero_buffer(&mut self, dev: &ID3D12Device, idx: usize) -> Option<ID3D12Resource> {
@@ -1102,6 +1103,18 @@ struct PendingUnmapBatch<Op, F> {
     ops: Vec<Op>,
     /// `None` if signaling any live queue failed (held to avoid premature unmapping).
     marks: Option<Vec<(F, u64)>>,
+}
+
+/// Seal a pre-signal snapshot of unsealed unmaps with `marks` into `pending`, leaving any ops
+/// pushed concurrently after the snapshot untouched in `unsealed` for a future fresh signal.
+fn seal_snapshot_ops<Op, F>(
+    ops: Vec<Op>,
+    marks: Option<Vec<(F, u64)>>,
+    pending: &mut std::collections::VecDeque<PendingUnmapBatch<Op, F>>,
+) {
+    if !ops.is_empty() {
+        pending.push_back(PendingUnmapBatch { ops, marks });
+    }
 }
 
 /// Pop every front batch in `queue` whose fence marks have all completed.
@@ -1267,15 +1280,15 @@ impl Pages {
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
     /// pool heaps (above the warm spare count), returning their `ID3D12Heap`s to be dropped
     /// outside `PAGES.lock()`.
-    fn sweep_and_reclaim(&mut self, now: std::time::Instant, low_commit: bool) -> Vec<ID3D12Heap> {
+    fn sweep_and_reclaim(&mut self, now: std::time::Instant, low_commit: bool) -> Vec<RetiringHeap> {
         self.sweep(now);
         self.pool.drain_cooling_before(now, self.cool_bound());
         let keep_spare = if low_commit { 0 } else { keep_spare_pools() };
         let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare, POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
-            if let Some(h) = self.pools.take_heap(idx) {
-                dropped.push(h);
+            if let Some((heap, zero_buf)) = self.pools.take_heap(idx) {
+                dropped.push(RetiringHeap { _zero_buf: zero_buf, _heap: heap });
             }
         }
         if !dropped.is_empty() {
@@ -2360,9 +2373,17 @@ impl<H, F: Clone> RetireQueue<H, F> {
     }
 }
 
-unsafe impl Send for RetireQueue<ID3D12Heap, ID3D12Fence> {}
+/// Reclaimed pool/arena heap paired with its optional placed `zero_buf` alias.
+/// `_zero_buf` is declared before `_heap` so Rust drops the placed buffer before its backing heap.
+struct RetiringHeap {
+    _zero_buf: Option<ID3D12Resource>,
+    _heap: ID3D12Heap,
+}
 
-static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<ID3D12Heap, ID3D12Fence>>>> = Mutex::new(None);
+unsafe impl Send for RetiringHeap {}
+unsafe impl Send for RetireQueue<RetiringHeap, ID3D12Fence> {}
+
+static RETIRE: Mutex<Option<std::collections::HashMap<usize, RetireQueue<RetiringHeap, ID3D12Fence>>>> = Mutex::new(None);
 static RETIRING_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Collect all known live command queues belonging to `dev_key` (deduplicated by raw ptr).
@@ -2387,7 +2408,7 @@ unsafe fn collect_device_queues(dev_key: usize, extra: Option<&ID3D12CommandQueu
 
 /// Retire `newly_reclaimed` across all live queues on `dev_key`, sweep completed batches, and prune
 /// dead-queue fences; drops every finished `ID3D12Heap` and `ID3D12Fence` outside all locks.
-unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<ID3D12Heap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
+unsafe fn retire_heaps_and_sweep(dev: &ID3D12Device, dev_key: usize, newly_reclaimed: Vec<RetiringHeap>, unmap_mark: Option<(ID3D12Fence, u64)>, extra_queue: Option<&ID3D12CommandQueue>) {
     let queues = collect_device_queues(dev_key, extra_queue);
     let live_keys: HashSet<usize> = queues.iter().map(|&(k, _)| k).collect();
     let _drop_outside_locks = {
@@ -2424,14 +2445,17 @@ unsafe fn signal_device_queues(
 /// `dev_key`, drain every completed unmap batch onto `pages.queue` (skipping cancelled/remapped
 /// targets and tiles), and drop popped COM resource references outside `PAGES.lock()`.
 unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue: Option<&ID3D12CommandQueue>) {
-    let (need_seal_unmaps, need_cool_probe, has_pending_or_probe) = {
-        let g = PAGES.lock().unwrap();
-        let Some(Some(pages)) = g.get(&dev_key) else { return };
-        let need_unmaps = !pages.unsealed_unmaps.is_empty();
+    // Snapshot `unsealed_unmaps` BEFORE releasing `PAGES.lock()` to signal live queues so any
+    // unmaps pushed concurrently after `signal_device_queues` are never sealed with stale marks.
+    let (snapshot_ops, need_cool_probe, has_pending_or_probe) = {
+        let mut g = PAGES.lock().unwrap();
+        let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
+        let ops = std::mem::take(&mut pages.unsealed_unmaps);
         let need_probe = pages.has_live_queues && pages.cool_probe.is_none() && (!pages.pool.cooling.is_empty() || !pages.idle.is_empty());
         let has_waiters = !pages.pending_unmaps.is_empty() || pages.cool_probe.is_some();
-        (need_unmaps, need_probe, has_waiters)
+        (ops, need_probe, has_waiters)
     };
+    let need_seal_unmaps = !snapshot_ops.is_empty();
     if !need_seal_unmaps && !need_cool_probe && !has_pending_or_probe {
         return;
     }
@@ -2444,11 +2468,12 @@ unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue:
     let mut drop_outside: Vec<ID3D12Resource> = Vec::new();
     {
         let mut g = PAGES.lock().unwrap();
-        let Some(Some(pages)) = g.get_mut(&dev_key) else { return };
-        if !pages.unsealed_unmaps.is_empty() {
-            let ops = std::mem::take(&mut pages.unsealed_unmaps);
-            pages.pending_unmaps.push_back(PendingUnmapBatch { ops, marks: marks.clone() });
-        }
+        let Some(Some(pages)) = g.get_mut(&dev_key) else {
+            drop(g);
+            drop(snapshot_ops);
+            return;
+        };
+        seal_snapshot_ops(snapshot_ops, marks.clone(), &mut pages.pending_unmaps);
         if pages.has_live_queues && pages.cool_probe.is_none() && (!pages.pool.cooling.is_empty() || !pages.idle.is_empty()) {
             if let Some(probe_marks) = marks {
                 pages.cool_probe = Some((probe_at, probe_marks));
@@ -2503,6 +2528,8 @@ unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue:
         if !newly_fenced_tiles.is_empty() {
             pages.flush_signal();
             pages.fenced_tiles.push_back((pages.value, newly_fenced_tiles));
+        } else if pages.dirty_signal {
+            pages.flush_signal();
         }
         pages.drain_fenced_tiles();
     }
@@ -2572,10 +2599,57 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         seal_and_drain_unmaps(&dev, dev_key, Some(queue));
     }
     if do_reclaim {
-        newly_reclaimed.extend(ARENAS.lock().unwrap().sweep_dropped_for(dev_key, now));
+        newly_reclaimed.extend(
+            ARENAS
+                .lock()
+                .unwrap()
+                .sweep_dropped_for(dev_key, now)
+                .into_iter()
+                .map(|heap| RetiringHeap { _zero_buf: None, _heap: heap }),
+        );
     }
     if do_reclaim || !newly_reclaimed.is_empty() || RETIRING_BATCHES.load(std::sync::atomic::Ordering::Acquire) > 0 {
         retire_heaps_and_sweep(&dev, dev_key, newly_reclaimed, unmap_mark, Some(queue));
+    }
+}
+
+/// Pure-CPU predicate: whether `queue` (last waited at `waited`) must flush/wait on `vram`
+/// mappings or pending recycled-tile zero-fills before submitting GPU work.
+#[inline]
+fn needs_mapping_wait(dirty_signal: bool, has_pending_zero: bool, waited: u64, value: u64) -> bool {
+    dirty_signal || has_pending_zero || waited < value
+}
+
+/// Fast-path wait for any tile mappings or recycled-tile zero-fills queued on `queue`'s device
+/// after `title_textures::refresh` (for example while `record_deferred` waited on PSO builds).
+pub(super) unsafe fn wait_pending_mappings(queue: &ID3D12CommandQueue) {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let dev_key = dev.as_raw() as usize;
+    let key = queue.as_raw() as usize;
+    let mut mapping_wait: Option<(ID3D12Fence, u64)> = None;
+    {
+        let mut g = PAGES.lock().unwrap();
+        if let Some(Some(pages)) = g.get_mut(&dev_key) {
+            let waited = pages.waited.get(&key).copied().unwrap_or(0);
+            if needs_mapping_wait(pages.dirty_signal, !pages.pending_zero_tiles.is_empty(), waited, pages.value) {
+                pages.flush_zero_tiles(&dev);
+                pages.flush_signal();
+                if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+                    mapping_wait = Some((pages.fence.clone(), pages.value));
+                    pages.waited.insert(key, pages.value);
+                }
+            }
+        }
+    }
+    if let Some((fence, value)) = mapping_wait {
+        if !super::sparse::cpu_waited_for_mappings(&fence, value, "texture page mappings") {
+            let _ = queue.Wait(&fence, value);
+            super::list_x::note_internal_wait(key, "texture page mappings", &fence, value);
+        }
     }
 }
 
@@ -2917,7 +2991,13 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     let dev_key = dev.as_raw() as usize;
     let (taken, expired) = ARENAS.lock().unwrap().take_for(dev_key, va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align));
     if !expired.is_empty() {
-        retire_heaps_and_sweep(dev, dev_key, expired, None, None);
+        retire_heaps_and_sweep(
+            dev,
+            dev_key,
+            expired.into_iter().map(|heap| RetiringHeap { _zero_buf: None, _heap: heap }).collect(),
+            None,
+            None,
+        );
     }
     let (heap, offset, id) = taken?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
@@ -4012,5 +4092,105 @@ mod tests {
         assert_eq!(coalesce_tile_runs(&mut tiles), vec![(0, 2, 2), (0, 10, 1), (1, 4, 3)]);
         let mut empty = Vec::new();
         assert!(coalesce_tile_runs(&mut empty).is_empty());
+    }
+
+    #[test]
+    fn seal_and_drain_unmaps_does_not_attach_stale_marks_to_concurrent_unmaps() {
+        use std::collections::VecDeque;
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        let mut unsealed: Vec<&'static str> = vec!["unmap_before_signal"];
+        let mut pending: VecDeque<PendingUnmapBatch<&'static str, Arc<AtomicU64>>> = VecDeque::new();
+        // Step 1: Take snapshot BEFORE signaling queues.
+        let snapshot = std::mem::take(&mut unsealed);
+        // Step 2: Signal queues at fence value 1 while lock is dropped.
+        let q_fence = Arc::new(AtomicU64::new(0));
+        let stale_marks = Some(vec![(q_fence.clone(), 1)]);
+        // Step 3: Concurrent thread pushes a newer unmap AFTER queue signal (and after a newer submit).
+        unsealed.push("unmap_after_signal");
+        // Step 4: Seal ONLY the pre-signal snapshot with `stale_marks`.
+        seal_snapshot_ops(snapshot, stale_marks, &mut pending);
+        assert_eq!(unsealed, vec!["unmap_after_signal"], "concurrent unmap must stay unsealed for a fresh fence mark");
+        // Even once fence value 1 completes, only the pre-signal op drains.
+        q_fence.store(1, Ordering::SeqCst);
+        let ready = drain_ready_unmap_batches(&mut pending, |f| f.load(Ordering::SeqCst));
+        assert_eq!(ready, vec!["unmap_before_signal"]);
+        assert!(pending.is_empty());
+        // A subsequent seal attaches fresh fence value 2 to the concurrent op.
+        let snapshot2 = std::mem::take(&mut unsealed);
+        seal_snapshot_ops(snapshot2, Some(vec![(q_fence.clone(), 2)]), &mut pending);
+        assert!(drain_ready_unmap_batches(&mut pending, |f| f.load(Ordering::SeqCst)).is_empty());
+        q_fence.store(2, Ordering::SeqCst);
+        assert_eq!(
+            drain_ready_unmap_batches(&mut pending, |f| f.load(Ordering::SeqCst)),
+            vec!["unmap_after_signal"]
+        );
+    }
+
+    #[test]
+    fn wait_pending_mappings_flushes_post_refresh_dirty_signal() {
+        // Already caught up, no dirty mappings, no pending zero-fills -> fast-path skips wait.
+        assert!(!needs_mapping_wait(false, false, 6314, 6314));
+        // Unsignaled UpdateTileMappings queued during record_deferred (e.g. L21120) -> must flush & wait.
+        assert!(needs_mapping_wait(true, false, 6314, 6314));
+        // Recycled tiles queued for GPU zero-fill during record_deferred -> must flush & wait.
+        assert!(needs_mapping_wait(false, true, 6314, 6314));
+        // Another thread flushed/signaled vram pages 6315..6317 during record_deferred -> must wait.
+        assert!(needs_mapping_wait(false, false, 6314, 6317));
+    }
+
+    #[test]
+    fn retire_queue_keeps_zero_buf_alive_until_marks_complete() {
+        use std::sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        };
+        struct DropTracker(Arc<AtomicUsize>, &'static str, Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                self.2.lock().unwrap().push(self.1);
+            }
+        }
+        struct FakeRetiringHeap {
+            _zero_buf: Option<DropTracker>,
+            _heap: DropTracker,
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let item = FakeRetiringHeap {
+            _zero_buf: Some(DropTracker(dropped.clone(), "zero_buf", order.clone())),
+            _heap: DropTracker(dropped.clone(), "heap", order.clone()),
+        };
+        let mut rq: RetireQueue<FakeRetiringHeap, Arc<AtomicU64>> = RetireQueue::new();
+        let unmap_f = Arc::new(AtomicU64::new(0));
+        let q_f = Arc::new(AtomicU64::new(0));
+        let queues = vec![(1usize, q_f.clone())];
+        let immediate = rq.retire_with(
+            vec![item],
+            Some((unmap_f.clone(), 1)),
+            &queues,
+            || Some(q_f.clone()),
+            |_, _, _| true,
+        );
+        assert!(immediate.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0, "neither zero_buf nor heap may drop before marks complete");
+
+        let live: HashSet<usize> = [1usize].into_iter().collect();
+        // Queue done, unmap mark still pending -> still alive.
+        q_f.store(1, Ordering::SeqCst);
+        let (done, _) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert!(done.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        // Once unmap_mark completes too, batch reaps and drops zero_buf BEFORE heap.
+        unmap_f.store(1, Ordering::SeqCst);
+        let (done, _) = rq.sweep_with(&live, |f| f.load(Ordering::SeqCst));
+        assert_eq!(done.len(), 1);
+        drop(done);
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(*order.lock().unwrap(), vec!["zero_buf", "heap"]);
     }
 }
