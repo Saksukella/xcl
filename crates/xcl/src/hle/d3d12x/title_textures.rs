@@ -1999,7 +1999,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`hash_and_detile_all`)
-const PARALLEL_BYTES: usize = 1 << 20;
+const PARALLEL_BYTES: usize = 256 << 10;
 
 struct DetileState {
     gen: u64,
