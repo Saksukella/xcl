@@ -2445,6 +2445,13 @@ unsafe fn signal_device_queues(
 /// `dev_key`, drain every completed unmap batch onto `pages.queue` (skipping cancelled/remapped
 /// targets and tiles), and drop popped COM resource references outside `PAGES.lock()`.
 unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue: Option<&ID3D12CommandQueue>) {
+    seal_and_drain_unmaps_with(dev_key, || signal_device_queues(dev, dev_key, extra_queue));
+}
+
+unsafe fn seal_and_drain_unmaps_with<F>(dev_key: usize, signal: F)
+where
+    F: FnOnce() -> Option<Vec<(ID3D12Fence, u64)>>,
+{
     // Snapshot `unsealed_unmaps` BEFORE releasing `PAGES.lock()` to signal live queues so any
     // unmaps pushed concurrently after `signal_device_queues` are never sealed with stale marks.
     let (snapshot_ops, need_cool_probe, has_pending_or_probe) = {
@@ -2460,7 +2467,7 @@ unsafe fn seal_and_drain_unmaps(dev: &ID3D12Device, dev_key: usize, extra_queue:
         return;
     }
     let marks = if need_seal_unmaps || need_cool_probe {
-        signal_device_queues(dev, dev_key, extra_queue)
+        signal()
     } else {
         None
     };
@@ -4192,5 +4199,234 @@ mod tests {
         drop(done);
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
         assert_eq!(*order.lock().unwrap(), vec!["zero_buf", "heap"]);
+    }
+
+    #[test]
+    fn seal_and_drain_unmaps_leaves_concurrent_unmap_unsealed() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(pages) = Pages::new(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R16_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            let res = r.unwrap();
+            let q_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let dev_key = dev.as_raw() as usize;
+
+            let prev = {
+                let mut g = PAGES.lock().unwrap();
+                let prev = g.insert(dev_key, Some(pages));
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                p.unsealed_unmaps.push(PendingUnmapOp::Whole {
+                    res: res.clone(),
+                    key: 0x1111,
+                    gen: 1,
+                    total: 1,
+                    tiles: Vec::new(),
+                });
+                prev
+            };
+
+            let res_concurrent = res.clone();
+            let fence_for_signal = q_fence.clone();
+            seal_and_drain_unmaps_with(dev_key, move || {
+                // Simulate another thread queuing a new unmap while `PAGES.lock()` is released.
+                let mut g = PAGES.lock().unwrap();
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                p.unsealed_unmaps.push(PendingUnmapOp::Whole {
+                    res: res_concurrent,
+                    key: 0x2222,
+                    gen: 2,
+                    total: 1,
+                    tiles: Vec::new(),
+                });
+                Some(vec![(fence_for_signal, 1)])
+            });
+
+            let removed = {
+                let mut g = PAGES.lock().unwrap();
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                assert_eq!(p.unsealed_unmaps.len(), 1, "concurrent unmap must stay unsealed for a fresh fence mark");
+                assert!(matches!(p.unsealed_unmaps[0], PendingUnmapOp::Whole { key: 0x2222, .. }));
+                assert_eq!(p.pending_unmaps.len(), 1, "only pre-signal snapshot should be sealed");
+                assert_eq!(p.pending_unmaps[0].ops.len(), 1);
+                assert!(matches!(p.pending_unmaps[0].ops[0], PendingUnmapOp::Whole { key: 0x1111, .. }));
+                let cur = g.remove(&dev_key);
+                if let Some(prev_val) = prev {
+                    g.insert(dev_key, prev_val);
+                }
+                cur
+            };
+            drop(removed);
+            drop(res);
+            drop(q_fence);
+        }
+    }
+
+    #[test]
+    fn vram_wait_pending_mappings_and_recycle_ready_flush_and_wait() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_SAMPLE_DESC};
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(pages) = Pages::new(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("tiled tier < 2");
+            };
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R16_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).unwrap();
+            let res = r.unwrap();
+            let mut total = 0u32;
+            dev.GetResourceTiling(&res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            assert!(total >= 1);
+
+            let dev_key = dev.as_raw() as usize;
+            let q_key = q.as_raw() as usize;
+            let prev = {
+                let mut g = PAGES.lock().unwrap();
+                let prev = g.insert(dev_key, Some(pages));
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                p.dirty_signal = true;
+                prev
+            };
+
+            // 1. Shipped `wait_pending_mappings` must flush `dirty_signal` and record wait for `q`.
+            wait_pending_mappings(&q);
+            let before_recycle_val = {
+                let g = PAGES.lock().unwrap();
+                let p = g.get(&dev_key).unwrap().as_ref().unwrap();
+                assert!(!p.dirty_signal, "wait_pending_mappings must flush dirty_signal");
+                assert!(p.value >= 1, "wait_pending_mappings must advance and signal page fence");
+                assert_eq!(p.waited.get(&q_key).copied(), Some(p.value), "wait_pending_mappings must record queue wait");
+                p.value
+            };
+
+            // 2. Shipped `recycle_ready` must unmap AND flush_signal on `pages.queue` before parking.
+            let raw = res.into_raw() as usize;
+            park_recyclable(
+                raw,
+                RecycleInfo {
+                    dev_key,
+                    key: ReservedKey::from_desc(&desc, 0),
+                    total,
+                    was_mapped: true,
+                    levels: None,
+                },
+                0,
+            );
+            let recycled = recycle_ready(raw);
+            let (parked, wait_fence, wait_val, removed) = {
+                let mut g = PAGES.lock().unwrap();
+                let p = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                if recycled {
+                    assert!(!p.dirty_signal, "recycle_ready must flush_signal after unmap");
+                    assert!(p.value > before_recycle_val, "recycle_ready must advance page fence after unmap");
+                }
+                let parked: Vec<usize> = p.reserved_pool.order.drain(..).map(|(_, ptr)| ptr).collect();
+                p.reserved_pool.by_key.clear();
+                p.reserved_pool.live = 0;
+                let wf = p.fence.clone();
+                let wv = p.value;
+                let cur = g.remove(&dev_key);
+                if let Some(prev_val) = prev {
+                    g.insert(dev_key, prev_val);
+                }
+                (parked, wf, wv, cur)
+            };
+            let _ = wait_fence.SetEventOnCompletion(wait_val, windows::Win32::Foundation::HANDLE::default());
+            if recycled {
+                for ptr in parked {
+                    release_raw_com(ptr);
+                }
+            } else {
+                release_raw_com(raw);
+            }
+            drop(removed);
+            drop(q);
+            assert!(recycled, "recycle_ready should park resource when reserved pool is enabled");
+        }
+    }
+
+    #[test]
+    fn pool_heaps_take_heap_keeps_zero_buf_alive_in_retire_queue() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe fn com_refcount(res: &ID3D12Resource) -> u32 {
+            let ptr = res.as_raw();
+            let vtbl = *(ptr as *const *const usize);
+            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(1));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+            let _ = add_ref(ptr);
+            release(ptr)
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let Some(heap) = alloc_pool_heap(&dev) else {
+                return crate::gpu::recomp::runner::skip_test("no pool heap");
+            };
+            let mut ph = PoolHeaps::new();
+            let idx = ph.push_heap(heap);
+            let zb_probe = ph.zero_buffer(&dev, idx as usize).expect("zero_buf placed alias");
+            assert_eq!(com_refcount(&zb_probe), 2, "PoolHeaps + probe must hold 2 refs");
+
+            let (taken_heap, taken_zb) = ph.take_heap(idx).expect("take_heap returns heap + zero_buf");
+            assert!(taken_zb.is_some(), "take_heap must return placed zero_buf instead of dropping it early");
+            assert_eq!(com_refcount(&zb_probe), 2, "zero_buf must stay alive after take_heap");
+
+            let q_fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut rq: RetireQueue<RetiringHeap, ID3D12Fence> = RetireQueue::new();
+            let retiring = RetiringHeap { _zero_buf: taken_zb, _heap: taken_heap };
+            let immediate = rq.retire_with(
+                vec![retiring],
+                None,
+                &[(1usize, q_fence.clone())],
+                || Some(q_fence.clone()),
+                |_, _, _| true,
+            );
+            assert!(immediate.is_empty());
+            assert_eq!(com_refcount(&zb_probe), 2, "RetireQueue must keep zero_buf alive until fence completes");
+
+            let live: HashSet<usize> = [1usize].into_iter().collect();
+            let (done_early, _) = rq.sweep_with(&live, |f| f.GetCompletedValue());
+            assert!(done_early.is_empty());
+            assert_eq!(com_refcount(&zb_probe), 2);
+
+            q_fence.Signal(1).unwrap();
+            let (done, _) = rq.sweep_with(&live, |f| f.GetCompletedValue());
+            assert_eq!(done.len(), 1);
+            drop(done);
+            assert_eq!(com_refcount(&zb_probe), 1, "RetireQueue must release zero_buf once fence completes");
+            drop(zb_probe);
+        }
     }
 }

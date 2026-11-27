@@ -4508,4 +4508,33 @@ mod tests {
             assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
         }
     }
+
+    #[test]
+    fn sparse_wait_pending_mappings_flushes_queued_mapping() {
+        unsafe {
+            let (base, s) = test_state_with_reserved(1);
+            let q: ID3D12CommandQueue = s.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).expect("queue");
+            let q_key = q.as_raw() as usize;
+            s.mapping_queued.store(true, Ordering::Relaxed);
+            assert_eq!(s.value, 0);
+
+            let prev = lock_state().replace(s);
+            wait_pending_mappings(&q);
+
+            let s = {
+                let mut g = lock_state();
+                let cur = g.take().expect("state present");
+                *g = prev;
+                cur
+            };
+            assert!(!s.mapping_queued.load(Ordering::Relaxed), "wait_pending_mappings must flush mapping_queued");
+            assert!(s.value >= 1, "wait_pending_mappings must signal sparse fence");
+            assert_eq!(s.waited.get(&q_key).copied(), Some(s.value), "wait_pending_mappings must record queue wait");
+
+            s.wait_for(s.value);
+            drop(q);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), 0);
+        }
+    }
 }
